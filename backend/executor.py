@@ -1,0 +1,2396 @@
+"""
+executor.py — Autonomous Python Project Execution Engine v4
+============================================================
+Robust, self-healing runner for any Python GitHub repository.
+
+PIPELINE:
+  1.  Clone repo (shallow, with timeout)
+  2.  Inspect workspace — tree, README, setup files, entry candidates
+  3.  Deep README parse — extract exact ordered commands
+  4.  Read top-10 key source files (real content, not inferred)
+  5.  Detect package manager → create venv → install deps
+  6.  Discover env-var hints (.env.example / .env.sample)
+  7.  LLM comprehensive plan (full context: tree + file content + README)
+       ↳ Decides runnable/not-runnable with DETAILED reasons
+  8.  NOT-RUNNABLE gate — explains exactly why + what user must do
+  9.  Credential gate — pauses for missing API keys, times out gracefully
+  10. Apply env vars / extra deps / pre-run steps
+  11. Build exact run command (README → LLM → heuristic, in priority order)
+  12. Execution loop:
+        run → classify error → autofix (no LLM) → LLM diagnose → retry
+        Max 7 attempts.  Fix journal prevents duplicate fixes.
+  13. Capture output files
+  14. Generate complete copyable bash script (always, even on failure)
+  15. Final report: success summary OR detailed manual guide with root cause
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import shlex
+import shutil
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import AsyncGenerator, Optional
+
+import httpx
+
+from llm import chat as llm_chat
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+CREDENTIAL_STORE:  dict[str, dict]          = {}
+CREDENTIAL_EVENTS: dict[str, asyncio.Event] = {}
+CREDENTIAL_TIMEOUT = 300          # seconds to wait for user credentials
+
+MAX_RETRIES    = int(os.getenv("EXECUTOR_MAX_RETRIES",   "7"))
+SCRIPT_TIMEOUT = int(os.getenv("EXECUTOR_TIMEOUT",       "180"))
+TOKEN_BUDGET   = int(os.getenv("EXECUTOR_TOKEN_BUDGET",  "60000"))
+LOG_LEVEL      = os.getenv("EXECUTOR_LOG_LEVEL",         "INFO")
+OUTPUT_ROOT    = os.getenv(
+    "EXECUTOR_OUTPUT_ROOT",
+    os.path.join(os.path.expanduser("~"), ".repomaster", "outputs"),
+)
+
+MAX_FILE_SIZE   = 500 * 1024 * 1024   # 500 MB
+TOP_FILES_N     = 10
+FILE_READ_CHARS = 2500
+
+OUTPUT_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg",
+    ".csv", ".json", ".jsonl", ".xml",
+    ".txt", ".md", ".log", ".html", ".pdf",
+    ".pt", ".pth", ".onnx", ".h5", ".pkl", ".joblib",
+    ".mp4", ".avi", ".mov", ".webm",
+    ".wav", ".mp3", ".flac", ".ogg",
+    ".npy", ".npz", ".parquet",
+}
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("executor")
+
+# Package managers in priority order (first match wins)
+PKG_MANAGERS = [
+    ("uv",         "uv.lock",           ["uv", "sync"]),
+    ("poetry",     "poetry.lock",       ["poetry", "install", "--no-interaction"]),
+    ("pipenv",     "Pipfile.lock",      ["pipenv", "install", "--skip-lock"]),
+    ("conda",      "environment.yml",   ["conda", "env", "update", "-f", "environment.yml"]),
+    ("pip-req",    "requirements.txt",  None),
+    ("pip-setup",  "setup.py",          None),
+    ("pip-pyproj", "pyproject.toml",    None),
+]
+
+# Patterns that indicate a web server or UI frontend launched successfully.
+# Processes like Flask/Streamlit/Gradio run forever and get killed by timeout,
+# so we check output to decide they actually succeeded before being terminated.
+_UI_SERVER_STARTED = re.compile(
+    r"Running on http://|"                     # Flask
+    r"Uvicorn running on|"                     # FastAPI / uvicorn
+    r"Application startup complete|"           # uvicorn / starlette
+    r"You can now view your Streamlit app|"    # Streamlit
+    r"Running on local URL:|"                  # Gradio
+    r"Dash is running on|"                     # Dash
+    r"\* Running on|"                          # Flask dev server
+    r"Started server process|"                 # uvicorn log
+    r"Serving Flask app|"                      # Flask
+    r"Notebook server is running|"             # Jupyter
+    r"To access the notebook|"                 # Jupyter
+    r"http://localhost:\d+|"                   # any localhost URL
+    r"http://127\.0\.0\.1:\d+",               # any 127.0.0.1 URL
+    re.IGNORECASE,
+)
+
+# Regex patterns for automatic error classification
+AUTOFIX_PATTERNS: dict[str, re.Pattern] = {
+    "missing_module": re.compile(
+        r"ModuleNotFoundError[^\n]*['\"]([a-zA-Z0-9_\-]+)['\"]"),
+    "api_change": re.compile(
+        r"ImportError: cannot import name ['\"]([a-zA-Z0-9_\-]+)['\"]"),
+    "interactive_prompt": re.compile(
+        r"\[y/n\]|\[yes/no\]|\(y\)\s*:|\(n\)\s*:|Are you sure|"
+        r"Continue\?|Overwrite\?|Proceed\?|already exists.*\[y",
+        re.IGNORECASE),
+    "missing_argument": re.compile(
+        r"Missing option|Missing argument|missing.*required|required.*argument|"
+        r"Error: Missing|the following arguments are required|"
+        r"error: argument .* is required|"
+        r"TypeError:.*argument|"
+        r"Usage:.*\[OPTIONS\]",
+        re.IGNORECASE),
+    "missing_file": re.compile(r"FileNotFoundError.*['\"](.+?)['\"]"),
+    "bad_encoding": re.compile(r"UnicodeDecodeError"),
+    "timeout":      re.compile(r"TimeoutError|timed out", re.I),
+    "cuda_error":   re.compile(r"CUDA error|RuntimeError.*CUDA|cuda.*invalid", re.I),
+    "port_in_use":  re.compile(r"Address already in use|port.*in use", re.I),
+    "permission":   re.compile(r"PermissionError|Permission denied", re.I),
+}
+
+# Common import alias → PyPI package name
+IMPORT_TO_PYPI: dict[str, str] = {
+    "cv2":      "opencv-python",
+    "sklearn":  "scikit-learn",
+    "PIL":      "Pillow",
+    "bs4":      "beautifulsoup4",
+    "yaml":     "PyYAML",
+    "dotenv":   "python-dotenv",
+    "Crypto":   "pycryptodome",
+    "serial":   "pyserial",
+    "gi":       "PyGObject",
+    "wx":       "wxPython",
+    "usb":      "pyusb",
+    "skimage":  "scikit-image",
+    "tensorflow": "tensorflow-cpu",
+    "tf":       "tensorflow-cpu",
+    "torch":    "torch",
+    "torchvision": "torchvision",
+    "flask":    "flask",
+    "fastapi":  "fastapi",
+    "uvicorn":  "uvicorn",
+    "aiohttp":  "aiohttp",
+    "requests": "requests",
+    "httpx":    "httpx",
+    "pydantic": "pydantic",
+    "sqlalchemy": "SQLAlchemy",
+    "pymongo":  "pymongo",
+    "redis":    "redis",
+    "celery":   "celery",
+    "numpy":    "numpy",
+    "pandas":   "pandas",
+    "matplotlib": "matplotlib",
+    "seaborn":  "seaborn",
+    "plotly":   "plotly",
+    "scipy":    "scipy",
+    "nltk":     "nltk",
+    "spacy":    "spacy",
+    "transformers": "transformers",
+    "datasets": "datasets",
+    "tqdm":     "tqdm",
+    "click":    "click",
+    "typer":    "typer",
+    "rich":     "rich",
+    "loguru":   "loguru",
+    "pexpect":  "pexpect",
+    "paramiko": "paramiko",
+    "boto3":    "boto3",
+    "google":   "google-cloud",
+    "azure":    "azure-identity",
+    "openai":   "openai",
+    "anthropic": "anthropic",
+    "groq":     "groq",
+    "langchain": "langchain",
+    "streamlit": "streamlit",
+    "gradio":   "gradio",
+    "dash":     "dash",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Runnability Categories  (used in not-runnable analysis)
+# ─────────────────────────────────────────────────────────────────────────────
+
+NOT_RUNNABLE_CATEGORIES = {
+    "pure_library": (
+        "This is a Python library/package meant to be imported, not executed directly. "
+        "It has no CLI entry point or main script."
+    ),
+    "missing_data": (
+        "The repo requires large datasets, model weights, or external data files "
+        "that are not included and must be downloaded separately."
+    ),
+    "gpu_required": (
+        "This project requires a CUDA GPU to run. "
+        "It cannot run on CPU-only systems."
+    ),
+    "paid_api_required": (
+        "This project requires paid API credentials (e.g. OpenAI, AWS, GCP) "
+        "that cannot be stubbed or mocked."
+    ),
+    "incomplete_project": (
+        "The repository appears incomplete — missing key files, broken imports, "
+        "or placeholder code that was never finished."
+    ),
+    "os_specific": (
+        "This project only runs on a specific OS (Windows-only .bat scripts, "
+        "macOS-only frameworks, etc.) that differs from the current environment."
+    ),
+    "compiled_only": (
+        "This project requires compiled C/C++/Rust extensions that must be "
+        "built from source, which may fail without the correct build toolchain."
+    ),
+    "notebook_only": (
+        "This is a Jupyter notebook project with no standalone Python script. "
+        "It must be run interactively in a Jupyter environment."
+    ),
+    "docker_only": (
+        "This project is designed to run exclusively inside Docker. "
+        "No plain Python entry point exists."
+    ),
+    "gui_only": (
+        "This is a GUI application (Tkinter, PyQt, wxPython, etc.) "
+        "that cannot run in a headless/terminal environment."
+    ),
+    "missing_credentials": (
+        "This project requires API keys or secrets that were not provided."
+    ),
+    "other": (
+        "The project cannot be run automatically for reasons identified below."
+    ),
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def run_execution_loop(
+    task:           str,
+    repo_full_name: str,
+    analysis:       dict,
+    job_id:         str = "",
+    input_files:    list[str] | None = None,
+) -> AsyncGenerator[dict, None]:
+    """
+    Autonomous execution pipeline.  Yields SSE event dicts.
+
+    Final 'done' event extra fields:
+        job_id, returncode, output, output_files,
+        run_script    — complete copy-pasteable bash script
+        manual_guide  — step-by-step guide (populated when run fails)
+        fix_journal, iterations, elapsed_s
+        not_runnable  — bool: True if repo cannot be run
+        not_runnable_reason  — detailed explanation string
+    """
+    metrics    = _fresh_metrics()
+    workspace: Optional[str] = None
+    venv_path: Optional[str] = None
+    fix_journal: list[dict]  = []
+    t_start = time.monotonic()
+
+    repo_name = repo_full_name.split("/")[-1]
+    llm_plan: dict = {}
+    pm_info:  dict = {"name": "pip-req", "file": "requirements.txt", "cmd": None}
+
+    yield _ev("context", "Execution context assembled",
+              f"Task: {task}\nRepo: {repo_full_name}\n"
+              f"Max retries: {MAX_RETRIES} | Token budget: {TOKEN_BUDGET}",
+              metrics=metrics)
+
+    try:
+        # ── 1. Clone ──────────────────────────────────────────────────────────
+        workspace = await _clone_repo(repo_full_name, metrics)
+        yield _ev("explore", "Repository cloned",
+                  f"✓ {repo_full_name}", tool="git.clone", metrics=metrics)
+
+        # ── 2. Inject user input files ────────────────────────────────────────
+        if input_files:
+            injected = await _inject_input_files(workspace, input_files, job_id)
+            yield _ev("explore", f"Input files injected ({len(injected)})",
+                      "\n".join(injected), tool="file.inject", metrics=metrics)
+
+        # ── 3. Inspect workspace + README ─────────────────────────────────────
+        repo_ctx    = _inspect_workspace(workspace)
+        readme_cmds = _parse_readme_commands(repo_ctx.get("readme", ""))
+        metrics["files"] = repo_ctx["file_count"]
+
+        yield _ev("explore", "Workspace & README analysed",
+                  f"{repo_ctx['summary']}\n"
+                  f"README commands: {len(readme_cmds.get('all_commands', []))} found | "
+                  f"Has README: {readme_cmds.get('has_readme', False)} | "
+                  f"Primary cmd: {readme_cmds.get('primary_cmd', 'none')}",
+                  code="\n".join(repo_ctx["tree"][:60]),
+                  tool="repo.explore", metrics=metrics)
+
+        # ── 4. Read key file contents ─────────────────────────────────────────
+        file_contents = await _read_key_files(workspace, analysis, repo_ctx)
+        yield _ev("explore",
+                  f"Read {len(file_contents)} key source files",
+                  "\n".join(
+                      f"  {p} ({len(c)} chars)"
+                      for p, c in list(file_contents.items())[:12]),
+                  tool="files.read", metrics=metrics)
+
+        # ── 5. Package manager + venv + deps ──────────────────────────────────
+        pm_info = _detect_package_manager(workspace)
+        yield _ev("exec", f"Package manager: {pm_info['name']}",
+                  f"Detected: {pm_info['name']} (marker: {pm_info['file']})",
+                  tool="pkg.detect", metrics=metrics)
+
+        venv_path = os.path.join(workspace, ".venv")
+        venv_ok, venv_out = await _setup_environment(
+            workspace, venv_path, pm_info, metrics)
+
+        yield _ev(
+            "exec" if venv_ok else "feedback",
+            "Environment ready" if venv_ok else "Environment warnings (continuing)",
+            venv_out[:2000], tool="venv.setup", metrics=metrics)
+
+        # ── 6. Env-var hints ───────────────────────────────────────────────────
+        env_hints = _discover_env_hints(workspace)
+        if env_hints:
+            yield _ev("explore",
+                      f"Env-var hints found ({len(env_hints)})",
+                      "\n".join(f"  {k}={v}" for k, v in env_hints.items()),
+                      tool="env.discover", metrics=metrics)
+
+        # ── 7. LLM comprehensive plan ─────────────────────────────────────────
+        yield _ev("explore", "Sending full context to LLM for analysis…",
+                  f"{len(file_contents)} files + "
+                  f"{len(repo_ctx.get('readme',''))} chars README + "
+                  f"{len(analysis.get('tree') or repo_ctx.get('tree', []))} tree entries",
+                  tool="llm.plan", metrics=metrics)
+
+        llm_plan = await _llm_plan(
+            task, repo_full_name, analysis, repo_ctx,
+            file_contents, readme_cmds, env_hints, pm_info, metrics)
+
+        yield _ev("explore", "Execution plan ready",
+                  llm_plan.get("summary", ""),
+                  code=json.dumps(
+                      {k: v for k, v in llm_plan.items()
+                       if k not in ("revised_script",)},
+                      indent=2)[:3000],
+                  tool="llm.plan", metrics=metrics)
+
+        # ── 8. NOT-RUNNABLE GATE ───────────────────────────────────────────────
+        if not llm_plan.get("runnable", True):
+            not_runnable_detail = _build_not_runnable_report(llm_plan, repo_ctx)
+
+            yield _ev("not_runnable",
+                      "❌ Repository cannot be run automatically",
+                      not_runnable_detail,
+                      tool="runnable.gate", metrics=metrics)
+
+            total_elapsed = round(time.monotonic() - t_start, 2)
+            metrics["elapsed_s"] = total_elapsed
+
+            # Still generate a helpful bash script showing what *would* be needed
+            run_script = _generate_run_script(
+                repo_full_name, task, llm_plan, pm_info,
+                env_hints,
+                llm_plan.get("run_command") or "# No runnable command found",
+                [], [], 1, workspace)
+
+            yield _ev("done", "Analysis complete — not runnable",
+                      not_runnable_detail,
+                      metrics=metrics,
+                      extra={
+                          "job_id":              job_id,
+                          "returncode":          -1,
+                          "not_runnable":        True,
+                          "not_runnable_reason": not_runnable_detail,
+                          "run_script":          run_script,
+                          "manual_guide":        _not_runnable_markdown(llm_plan, repo_full_name),
+                          "iterations":          0,
+                          "fix_journal":         [],
+                          "elapsed_s":           total_elapsed,
+                          "output_files":        [],
+                          "output":              "",
+                      })
+            return
+
+        # ── 9. Credential gate ────────────────────────────────────────────────
+        missing_creds: dict[str, str] = {}
+        for k, v in llm_plan.get("env_vars", {}).items():
+            if k and (not v or str(v).upper() in
+                      ("YOUR_VALUE_HERE", "REPLACE_ME", "")) \
+                    and not os.environ.get(k):
+                missing_creds[k] = ""
+        for k in llm_plan.get("required_credentials", []):
+            if k and not os.environ.get(k):
+                missing_creds.setdefault(k, "")
+
+        if missing_creds:
+            ev_obj = asyncio.Event()
+            CREDENTIAL_EVENTS[job_id] = ev_obj
+            hints_for_creds = {
+                k: llm_plan.get("credential_hints", {}).get(k, "")
+                for k in missing_creds
+            }
+            yield _ev("credential_needed",
+                      f"Credentials required ({len(missing_creds)} missing)",
+                      "This repo needs API keys or secrets.\n"
+                      + "\n".join(
+                          f"  • {k}"
+                          + (f" — {hints_for_creds[k]}" if hints_for_creds.get(k) else "")
+                          for k in missing_creds
+                      ),
+                      tool="credential.gate", metrics=metrics,
+                      extra={
+                          "fields": list(missing_creds.keys()),
+                          "hints":  hints_for_creds,
+                      })
+            try:
+                await asyncio.wait_for(ev_obj.wait(), timeout=CREDENTIAL_TIMEOUT)
+                submitted = CREDENTIAL_STORE.pop(job_id, {})
+                for k, v in submitted.items():
+                    if k and v:
+                        os.environ[str(k)] = str(v)
+                yield _ev("explore",
+                          f"Credentials received ({len(submitted)})",
+                          "✓ Injected as environment variables.",
+                          tool="credential.gate", metrics=metrics)
+            except asyncio.TimeoutError:
+                yield _ev("feedback",
+                          f"Credential timeout ({CREDENTIAL_TIMEOUT}s) — continuing",
+                          "Missing credentials may cause execution to fail.",
+                          tool="credential.gate", metrics=metrics)
+            finally:
+                CREDENTIAL_EVENTS.pop(job_id, None)
+
+        # Apply env vars with real values
+        env_export_lines: list[str] = []
+        for k, v in llm_plan.get("env_vars", {}).items():
+            if k and v and str(v).upper() not in ("YOUR_VALUE_HERE", "REPLACE_ME", ""):
+                os.environ.setdefault(str(k), str(v))
+                env_export_lines.append(f'export {k}="{v}"')
+
+        # ── 10. Extra deps from LLM ────────────────────────────────────────────
+        extra_deps = llm_plan.get("extra_deps", [])
+        if extra_deps and venv_path:
+            pip = _pip_path(venv_path)
+            for dep in extra_deps[:15]:
+                dep = _sanitise(str(dep))
+                if dep:
+                    ok, out = await _run_cmd([pip, "install", dep], workspace, timeout=120)
+                    yield _ev("exec", f"Extra dep: {dep}",
+                              "✓ installed" if ok else f"⚠ failed: {out[:200]}",
+                              tool="deps.extra", metrics=metrics)
+
+        # ── 11. Pre-run setup steps ────────────────────────────────────────────
+        pre_steps      = llm_plan.get("pre_run_steps", [])
+        pre_steps_done: list[str] = []
+        if pre_steps and venv_path:
+            yield _ev("exec", f"Running {len(pre_steps)} pre-run setup steps",
+                      "\n".join(pre_steps[:5]), tool="setup.pre_run", metrics=metrics)
+            for step in pre_steps[:5]:
+                step = step.strip()
+                if not step or step.startswith("#"):
+                    continue
+                # Safety: block destructive commands
+                if any(bad in step for bad in (
+                    "rm -rf /", "sudo rm", "> /dev", "curl | bash", "wget | bash",
+                )):
+                    yield _ev("feedback", f"Blocked unsafe pre-run step: {step[:60]}",
+                              "Skipped for safety.", tool="setup.pre_run", metrics=metrics)
+                    continue
+                ok, out = await _run_cmd(["bash", "-c", step], workspace, timeout=300)
+                pre_steps_done.append(step)
+                yield _ev("exec", f"Pre-run: {step[:60]}",
+                          ("✓ done" if ok else "⚠ non-zero") + f"\n{out[:400]}",
+                          tool="setup.pre_run", metrics=metrics)
+
+        # ── 12. Build exact run command ────────────────────────────────────────
+        run_cmd, cmd_source = _build_run_command(
+            llm_plan, analysis, repo_ctx,
+            input_files or [], workspace, readme_cmds)
+
+        yield _ev("exec", f"Run command — {cmd_source}",
+                  f"$ {run_cmd}",
+                  code=run_cmd, tool="cmd.build", metrics=metrics)
+
+        # ── 13. Execution + fix loop ───────────────────────────────────────────
+        final_rc     = 1
+        final_stdout = ""
+        final_stderr = ""
+        iteration_log: list[dict] = []
+
+        for attempt in range(MAX_RETRIES):
+            metrics["iters"] = attempt + 1
+            t_attempt = time.monotonic()
+
+            yield _ev("exec",
+                      f"Attempt {attempt + 1}/{MAX_RETRIES}",
+                      f"$ {run_cmd}",
+                      code=run_cmd, tool="bash.run", metrics=metrics)
+
+            final_rc, final_stdout, final_stderr = await _run_direct(
+                run_cmd, workspace, venv_path or "")
+
+            elapsed    = round(time.monotonic() - t_attempt, 2)
+            run_output = _fmt_output(final_rc, final_stdout, final_stderr)
+
+            iteration_log.append({
+                "attempt":    attempt + 1,
+                "command":    run_cmd,
+                "returncode": final_rc,
+                "stdout":     final_stdout[:3000],
+                "stderr":     final_stderr[:3000],
+                "elapsed_s":  elapsed,
+            })
+
+            # Treat a running web server / UI frontend as success.
+            # These processes run forever and are killed by timeout (rc != 0),
+            # but if the output shows the server started we count it as done.
+            if final_rc != 0 and _UI_SERVER_STARTED.search(final_stdout + final_stderr):
+                final_rc = 0
+
+            if final_rc == 0:
+                yield _ev("exec",
+                          f"✅ Attempt {attempt + 1} succeeded (exit 0)",
+                          f"Completed in {elapsed}s.",
+                          code=run_output[:4000],
+                          tool="bash.run", metrics=metrics)
+                break
+
+            error_class = _classify_error(final_stderr + final_stdout)
+            yield _ev("feedback",
+                      f"Attempt {attempt + 1} failed — class: [{error_class}]",
+                      _error_summary(final_stderr, final_stdout),
+                      code=run_output[:3000],
+                      tool="feedback.loop", metrics=metrics)
+
+            if attempt >= MAX_RETRIES - 1:
+                break
+
+            # ── Auto-fix (no LLM call) ─────────────────────────────────────
+            auto_fix = await _try_autofix(
+                error_class, final_stderr + final_stdout,
+                workspace, venv_path or "", fix_journal)
+
+            if auto_fix:
+                fix_journal.append({
+                    **auto_fix,
+                    "attempt": attempt + 1,
+                    "result":  "autofix_applied",
+                })
+                yield _ev("feedback",
+                          f"Auto-fix applied: {auto_fix['fix_type']}",
+                          auto_fix.get("explanation", ""),
+                          tool="autofix", metrics=metrics)
+                if auto_fix.get("fix_type") == "pipe_yes":
+                    run_cmd = f"yes | bash -c {shlex.quote(run_cmd)}"
+                if auto_fix.get("revised_command"):
+                    run_cmd = auto_fix["revised_command"]
+                continue
+
+            if metrics["tokens"] >= TOKEN_BUDGET:
+                yield _ev("feedback", "Token budget exhausted",
+                          f"Used {metrics['tokens']} / {TOKEN_BUDGET} tokens",
+                          tool="budget", metrics=metrics)
+                break
+
+            # ── LLM diagnose + targeted fix ────────────────────────────────
+            fix = await _llm_diagnose(
+                run_cmd, run_output, attempt, error_class, task,
+                workspace, venv_path or "",
+                repo_ctx, file_contents, fix_journal, metrics)
+
+            already_tried = {
+                e.get("detail", "") for e in fix_journal
+                if e.get("fix_type") == "fix_command"
+            }
+            if fix.get("revised_command") and fix.get("fix_type") == "fix_command":
+                fix["detail"] = fix["revised_command"].strip()
+
+            fix_journal.append({
+                **fix,
+                "attempt": attempt + 1,
+                "result":  "llm_fix_applied",
+            })
+            yield _ev("feedback",
+                      f"LLM fix → {fix.get('fix_type', 'unknown')}",
+                      fix.get("explanation", ""),
+                      code=fix.get("detail", "")[:1500],
+                      tool="feedback.fix", metrics=metrics)
+
+            await _apply_fix(fix, workspace, venv_path or "")
+
+            if fix.get("revised_command"):
+                new_cmd = fix["revised_command"].strip()
+                if new_cmd and new_cmd not in already_tried:
+                    run_cmd = new_cmd
+
+        # ── 14. Generate bash script ───────────────────────────────────────────
+        run_script = _generate_run_script(
+            repo_full_name, task, llm_plan, pm_info,
+            env_hints, run_cmd, pre_steps_done,
+            env_export_lines, final_rc, workspace)
+
+        # ── 15. Write artifacts ────────────────────────────────────────────────
+        ws = Path(workspace)
+        (ws / "run_final.sh").write_text(run_script, encoding="utf-8")
+        (ws / "execution_output.txt").write_text(
+            _fmt_output(final_rc, final_stdout, final_stderr), encoding="utf-8")
+        (ws / "execution_log.json").write_text(
+            json.dumps({
+                "task":        task,
+                "repo":        repo_full_name,
+                "success":     final_rc == 0,
+                "run_command": run_cmd,
+                "iterations":  iteration_log,
+                "fix_journal": fix_journal,
+                "metrics":     metrics,
+            }, indent=2), encoding="utf-8")
+
+        # ── 16. Capture output files ───────────────────────────────────────────
+        output_files = _capture_outputs(workspace, job_id)
+        yield _ev("exec",
+                  f"Outputs captured ({len(output_files)})",
+                  "\n".join(output_files),
+                  tool="output.capture", metrics=metrics)
+
+        total_elapsed = round(time.monotonic() - t_start, 2)
+        metrics["elapsed_s"] = total_elapsed
+
+        # ── 17. Final report ───────────────────────────────────────────────────
+        if final_rc == 0:
+            summary      = await _build_success_summary(
+                task, repo_full_name, iteration_log,
+                fix_journal, run_cmd, final_stdout, metrics)
+            manual_guide = ""
+        else:
+            summary, manual_guide = await _build_failure_guide(
+                task, repo_full_name, iteration_log, fix_journal,
+                run_cmd, final_stdout, final_stderr, llm_plan, metrics)
+
+        yield _ev("done", "Task completed", summary,
+                  metrics=metrics,
+                  extra={
+                      "job_id":              job_id,
+                      "returncode":          final_rc,
+                      "not_runnable":        False,
+                      "not_runnable_reason": "",
+                      "iterations":          len(iteration_log),
+                      "fix_journal":         fix_journal,
+                      "elapsed_s":           total_elapsed,
+                      "output_files":        output_files,
+                      "run_script":          run_script,
+                      "manual_guide":        manual_guide,
+                      "output": _fmt_output(
+                          final_rc, final_stdout, final_stderr)[:6000],
+                  })
+
+    except Exception as exc:
+        log.exception("Execution pipeline error")
+        yield _ev("feedback", "Pipeline error", str(exc), metrics=metrics)
+        fallback_script = _generate_run_script(
+            repo_full_name, task, llm_plan, pm_info,
+            {}, "# Could not determine run command — see error above",
+            [], [], 1, None)
+        yield _ev("done", "Task stopped",
+                  f"Pipeline error: {exc}",
+                  metrics=metrics,
+                  extra={
+                      "job_id":              job_id,
+                      "returncode":          1,
+                      "not_runnable":        False,
+                      "not_runnable_reason": "",
+                      "run_script":          fallback_script,
+                      "manual_guide":        f"## Pipeline Error\n\n```\n{exc}\n```\n",
+                      "output":              str(exc),
+                  })
+
+    finally:
+        if workspace and os.path.isdir(workspace):
+            shutil.rmtree(workspace, ignore_errors=True)
+            log.info("Workspace cleaned — outputs at %s/%s", OUTPUT_ROOT, job_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Not-Runnable Report Builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_not_runnable_report(llm_plan: dict, repo_ctx: dict) -> str:
+    """
+    Build a rich, human-readable explanation of WHY the repo cannot be run.
+    Covers: category, specific reason, what user needs, workarounds.
+    """
+    category   = llm_plan.get("not_runnable_category", "other")
+    why        = llm_plan.get("why_not_runnable", "")
+    workaround = llm_plan.get("workaround", "")
+    what_need  = llm_plan.get("what_user_needs", [])
+    summary    = llm_plan.get("summary", "")
+
+    # Get the canonical category description
+    cat_desc = NOT_RUNNABLE_CATEGORIES.get(
+        category, NOT_RUNNABLE_CATEGORIES["other"])
+
+    parts = [
+        f"CATEGORY: {category.replace('_', ' ').upper()}",
+        "",
+        f"WHY: {cat_desc}",
+        "",
+    ]
+
+    if why:
+        parts += [f"SPECIFIC REASON: {why}", ""]
+
+    if summary:
+        parts += [f"WHAT THIS REPO IS: {summary}", ""]
+
+    if what_need:
+        parts += ["WHAT YOU NEED TO RUN THIS:"]
+        for item in what_need:
+            parts.append(f"  • {item}")
+        parts.append("")
+
+    if workaround:
+        parts += [f"POSSIBLE WORKAROUND: {workaround}", ""]
+
+    # Add repo-specific clues from inspection
+    setup_files = repo_ctx.get("setup_files", [])
+    has_tests   = any("test" in str(f).lower() for f in repo_ctx.get("key_sources", []))
+
+    if "setup.py" in setup_files or "pyproject.toml" in setup_files:
+        if category == "pure_library":
+            parts += [
+                "HOW TO INSTALL AND USE:",
+                "  pip install -e .",
+                "  # Then import the package in your own Python script",
+                "",
+            ]
+
+    if has_tests and category == "pure_library":
+        parts += [
+            "HOW TO RUN TESTS:",
+            "  pip install -e .",
+            "  pytest",
+            "",
+        ]
+
+    return "\n".join(parts)
+
+
+def _not_runnable_markdown(llm_plan: dict, repo_full_name: str) -> str:
+    """Generate a full markdown manual guide for not-runnable repos."""
+    repo_name  = repo_full_name.split("/")[-1]
+    category   = llm_plan.get("not_runnable_category", "other")
+    why        = llm_plan.get("why_not_runnable", "Unknown reason")
+    workaround = llm_plan.get("workaround", "")
+    what_need  = llm_plan.get("what_user_needs", [])
+    summary    = llm_plan.get("summary", "")
+    cat_desc   = NOT_RUNNABLE_CATEGORIES.get(category, NOT_RUNNABLE_CATEGORIES["other"])
+
+    md = [
+        f"## ❌ Cannot Run Automatically: `{repo_name}`",
+        "",
+        f"**Category:** {category.replace('_', ' ').title()}  ",
+        f"**What this repo is:** {summary}",
+        "",
+        f"### Why It Cannot Run",
+        "",
+        f"{cat_desc}",
+        "",
+        f"**Specific reason:** {why}",
+        "",
+    ]
+
+    if what_need:
+        md += ["### What You Need", ""]
+        for item in what_need:
+            md.append(f"- {item}")
+        md.append("")
+
+    if workaround:
+        md += [
+            "### Possible Workaround",
+            "",
+            workaround,
+            "",
+        ]
+
+    # Category-specific guidance
+    if category == "pure_library":
+        md += [
+            "### How to Use This Library",
+            "",
+            "```bash",
+            f"git clone https://github.com/{repo_full_name}.git {repo_name}",
+            f"cd {repo_name}",
+            "python3 -m venv .venv && source .venv/bin/activate",
+            "pip install -e .",
+            "python -c 'import " + repo_name + "; help(" + repo_name + ")'",
+            "```",
+            "",
+        ]
+    elif category == "missing_data":
+        md += [
+            "### How to Get the Required Data",
+            "",
+            "Check the README for data download instructions.",
+            "Common locations: Hugging Face datasets, Google Drive, official project page.",
+            "",
+        ]
+    elif category == "gpu_required":
+        md += [
+            "### Running Without GPU",
+            "",
+            "Look for `--device cpu`, `--no-cuda`, or `USE_CPU=1` flags.",
+            "Some models support CPU inference but will be very slow.",
+            "",
+        ]
+    elif category == "missing_credentials":
+        required = llm_plan.get("required_credentials", [])
+        if required:
+            md += ["### Required Credentials", ""]
+            for cred in required:
+                hint = llm_plan.get("credential_hints", {}).get(cred, "")
+                md.append(f"- `{cred}`" + (f" — {hint}" if hint else ""))
+            md += [
+                "",
+                "```bash",
+            ]
+            for cred in required:
+                md.append(f'export {cred}="your_value_here"')
+            md += ["```", ""]
+
+    return "\n".join(md)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  README Command Parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_readme_commands(readme: str) -> dict:
+    """
+    Extract shell commands from README with multiple strategies:
+      1. Fenced code blocks (```bash / ```sh / ```console / ```)
+      2. Dollar-prompt lines ($ cmd  or  > cmd)
+      3. Inline backtick with prompt (`$ cmd`)
+      4. Section-aware extraction (Quick Start / Usage / Install)
+
+    Derives primary_cmd — the single best "run" command to try first,
+    taken from highest-priority section (quickstart > usage > examples).
+    """
+    if not readme:
+        return {
+            "all_commands": [], "install_cmds": [], "run_cmds": [],
+            "sections": {}, "primary_cmd": "", "has_readme": False,
+        }
+
+    all_cmds:     list[str] = []
+    install_cmds: list[str] = []
+    run_cmds:     list[str] = []
+    seen: set[str] = set()
+
+    RUN_STARTERS = re.compile(
+        r"^(python3?|python3?\.\d+|jupyter|streamlit|uvicorn|gunicorn|flask|"
+        r"node|npm\s+start|yarn\s+start|cargo\s+run|go\s+run|"
+        r"bash\s+\S|sh\s+\S|\.\/\S)",
+        re.I,
+    )
+    INSTALL_STARTERS = re.compile(
+        r"^(pip3?\s+install|conda\s+install|poetry\s+(install|add)|"
+        r"pipenv\s+install|npm\s+install|yarn\s+install)",
+        re.I,
+    )
+
+    def _add(cmd: str) -> None:
+        cmd = re.sub(r"^[\$\>\#]\s*", "", cmd.strip()).strip()
+        if not cmd or cmd in seen or cmd.startswith("#"):
+            return
+        seen.add(cmd)
+        all_cmds.append(cmd)
+        if INSTALL_STARTERS.match(cmd):
+            install_cmds.append(cmd)
+        if RUN_STARTERS.match(cmd):
+            run_cmds.append(cmd)
+
+    # 1. Fenced code blocks
+    for block in re.findall(
+        r"```(?:bash|sh|shell|console|terminal|zsh|cmd|text)?\n(.*?)```",
+        readme, re.DOTALL | re.IGNORECASE,
+    ):
+        for line in block.splitlines():
+            _add(line)
+
+    # 2. Dollar-prompt lines outside code blocks
+    clean = re.sub(r"```.*?```", "", readme, flags=re.DOTALL)
+    for line in clean.splitlines():
+        if re.match(r"^\s*[\$\>]\s+\S", line):
+            _add(line.strip())
+
+    # 3. Inline `$ cmd`
+    for m in re.findall(r"`\$\s+([^`]+)`", readme):
+        _add(m)
+
+    # 4. Section-aware extraction
+    section_patterns = {
+        "quickstart": re.compile(r"quick\s*start|getting\s*started|quick\s*setup",  re.I),
+        "install":    re.compile(r"^install|setup|prerequisites|requirements",       re.I),
+        "usage":      re.compile(r"usage|how\s+to\s+use|running|run|inference",      re.I),
+        "examples":   re.compile(r"example|demo",                                    re.I),
+    }
+    sections: dict[str, list[str]] = {}
+    cur_sec: Optional[str] = None
+
+    for line in readme.splitlines():
+        if re.match(r"^#{1,3}\s+", line):
+            cur_sec = None
+            for sec, pat in section_patterns.items():
+                if pat.search(line):
+                    cur_sec = sec
+                    sections.setdefault(sec, [])
+                    break
+        elif cur_sec:
+            stripped = re.sub(r"^[\$\>]\s*", "", line.strip())
+            if stripped and any(kw in stripped.lower() for kw in (
+                "python", "pip", "conda", "bash", "sh ",
+                "run", "npm", "node", "poetry", "streamlit",
+                "uvicorn", "flask", "gunicorn",
+            )):
+                sections[cur_sec].append(stripped)
+
+    def _best_run_from(cmds: list[str]) -> str:
+        candidates = [c for c in cmds if RUN_STARTERS.match(
+            re.sub(r"^[\$\>]\s*", "", c.strip()))]
+        return candidates[-1] if candidates else ""
+
+    primary_cmd = ""
+    for sec in ("quickstart", "usage", "examples"):
+        candidate = _best_run_from(sections.get(sec, []))
+        if candidate:
+            primary_cmd = candidate
+            break
+    if not primary_cmd and run_cmds:
+        primary_cmd = run_cmds[0]
+
+    return {
+        "all_commands": all_cmds[:30],
+        "install_cmds": install_cmds[:10],
+        "run_cmds":     run_cmds[:10],
+        "sections":     sections,
+        "primary_cmd":  primary_cmd,
+        "has_readme":   True,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Key File Reader
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _read_key_files(
+    workspace: str,
+    analysis:  dict,
+    repo_ctx:  dict,
+    max_files: int = TOP_FILES_N,
+    max_chars: int = FILE_READ_CHARS,
+) -> dict[str, str]:
+    ws   = Path(workspace)
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    def _add(path: str) -> None:
+        p = path.strip()
+        if p and p not in seen:
+            seen.add(p)
+            ordered.append(p)
+
+    # Primary: analyzer modules sorted by score — top-N by score from analyzer
+    for m in (analysis.get("modules") or [])[:max_files]:
+        _add(m.get("path", ""))
+    # Secondary: explicit key_files list (top-10 scored paths from analyzer)
+    for p in analysis.get("key_files", []):
+        _add(p)
+    for fname in (
+        "main.py", "app.py", "run.py", "cli.py", "demo.py",
+        "__main__.py", "inference.py", "predict.py",
+        "requirements.txt", "pyproject.toml", "setup.py",
+        "Makefile", "Dockerfile",
+    ):
+        if (ws / fname).is_file():
+            _add(fname)
+    for p in repo_ctx.get("setup_files",      []):
+        _add(p)
+    for p in repo_ctx.get("entry_candidates", []):
+        _add(p)
+
+    result: dict[str, str] = {}
+    count = 0
+    for rel in ordered:
+        if count >= max_files + 5:
+            break
+        full = ws / rel
+        if not full.is_file():
+            continue
+        try:
+            content = full.read_text(encoding="utf-8", errors="ignore")
+            if len(content) > max_chars:
+                content = content[:max_chars] + f"\n... [truncated at {max_chars} chars]"
+            result[rel] = content
+            count += 1
+        except Exception as exc:
+            log.warning("Could not read %s: %s", rel, exc)
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LLM Execution Plan  (comprehensive single call)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _llm_plan(
+    task:           str,
+    repo_full_name: str,
+    analysis:       dict,
+    repo_ctx:       dict,
+    file_contents:  dict[str, str],
+    readme_cmds:    dict,
+    env_hints:      dict,
+    pm_info:        dict,
+    metrics:        dict,
+) -> dict:
+    files_block = ""
+    for path, content in list(file_contents.items())[:TOP_FILES_N]:
+        files_block += (
+            f"\n{'─'*50}\n"
+            f"📄 FILE: {path}\n"
+            f"{'─'*50}\n"
+            f"{content}\n"
+        )
+
+    not_runnable_categories_list = "\n".join(
+        f'  "{k}": {v[:80]}...' for k, v in NOT_RUNNABLE_CATEGORIES.items()
+    )
+
+    prompt = f"""You are a Python project execution expert.
+Analyse this GitHub repository and produce a PRECISE, WORKING execution plan.
+
+━━━━ REPOSITORY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{repo_full_name}
+
+━━━━ TASK ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{task}
+
+━━━━ FILE TREE ({len(analysis.get('tree') or repo_ctx.get('tree', []))} entries) ━━━━━━━━━━━━━━━━
+{chr(10).join((analysis.get('tree') or repo_ctx.get('tree', []))[:80])}
+
+━━━━ PACKAGE MANAGER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Detected: {pm_info['name']}  (marker: {pm_info['file']})
+Setup files: {repo_ctx.get('setup_files', [])}
+
+━━━━ FULL README ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{repo_ctx.get('readme', 'No README found.')[:5000]}
+
+━━━━ README COMMANDS EXTRACTED ━━━━━━━━━━━━━━━━━━
+Run commands  : {readme_cmds.get('run_cmds', [])}
+Install cmds  : {readme_cmds.get('install_cmds', [])}
+All commands  : {readme_cmds.get('all_commands', [])[:20]}
+Quickstart    : {readme_cmds.get('sections', {}).get('quickstart', [])}
+Usage section : {readme_cmds.get('sections', {}).get('usage', [])}
+Primary cmd   : {readme_cmds.get('primary_cmd', 'none')}
+
+━━━━ KEY SOURCE FILES ({len(file_contents)} read) ━━━━━━━━━━━━━━━━━━━
+{files_block[:7000]}
+
+━━━━ STATIC ANALYSIS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Entry point : {analysis.get('entry_point', '')}
+Run command : {analysis.get('run_command', '')}
+Task plan   : {analysis.get('task_plan', [])}
+
+━━━━ ENV-VAR HINTS (.env.example) ━━━━━━━━━━━━━━━
+{list(env_hints.keys())}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RUNNABILITY DECISION RULES (follow strictly):
+- runnable=true ONLY if there is a concrete Python entry point (main.py, app.py,
+  __main__.py, CLI entry, etc.) that produces observable output when executed.
+- runnable=false if ANY of these is true:
+    • Pure library with no CLI/entry point (only __init__.py, no main.py)
+    • Requires GPU/CUDA that is unavailable
+    • Requires large external data/weights not included
+    • Requires paid API that cannot be stubbed (OpenAI, AWS, etc.)
+    • Project is obviously incomplete (TODO placeholders, missing core files)
+    • GUI-only app (Tkinter, PyQt) with no headless mode
+    • Missing essential credentials with no demo/mock mode
+- When runnable=false, pick the MOST SPECIFIC category from this list:
+{not_runnable_categories_list}
+
+INSTRUCTIONS:
+1. READ the README fully — find Quick Start / Usage / Examples section.
+2. READ the source files to understand entry points & required arguments.
+3. required_credentials: ONLY truly essential credentials (not optional).
+4. credential_hints: describe WHAT each credential is (e.g. "OpenAI API key for GPT-4 calls").
+5. pre_run_steps: commands to download weights, init DB, etc.
+6. run_command MUST be immediately executable — no <placeholder> values.
+7. what_user_needs: concrete list of things the user must provide/do if not runnable.
+8. workaround: if not runnable, suggest the best alternative approach.
+
+Return ONLY valid JSON — no markdown fences, no prose:
+{{
+  "summary": "1-2 sentence description of what this repo does",
+  "project_type": "cli_tool|web_app|api|ml_model|library|notebook|script|docker|other",
+  "runnable": true,
+  "not_runnable_category": "",
+  "why_not_runnable": "",
+  "what_user_needs": [],
+  "workaround": "",
+  "uses_docker": false,
+  "docker_command": "",
+  "entry_point": "relative/path/to/entry.py",
+  "run_command": "EXACT shell command",
+  "pre_run_steps": [],
+  "install_command": "pip install -r requirements.txt",
+  "env_vars": {{"KEY": "value"}},
+  "required_credentials": ["ENV_VAR_NAME"],
+  "credential_hints": {{"ENV_VAR_NAME": "what this key is used for"}},
+  "extra_deps": ["package_missing_from_requirements"],
+  "known_issues": ["description of known issue"],
+  "quickstart_steps": ["step1", "step2"],
+  "notes": "any important caveats from README"
+}}"""
+
+    try:
+        raw = await llm_chat(
+            system=(
+                "You are an expert Python project execution specialist. "
+                "Analyse the repository carefully — read README AND source files. "
+                "Be STRICT about runnability: only mark runnable=true if you "
+                "can construct a working run command right now. "
+                "Return ONLY valid JSON. No markdown fences. No preamble."
+            ),
+            user=prompt,
+            max_tokens=2000,
+            metrics=metrics,
+            temperature=0.1,
+        )
+        result = _parse_json(raw)
+        # Ensure all required keys exist
+        result.setdefault("runnable", True)
+        result.setdefault("not_runnable_category", "other")
+        result.setdefault("why_not_runnable", "")
+        result.setdefault("what_user_needs", [])
+        result.setdefault("workaround", "")
+        result.setdefault("credential_hints", {})
+        result.setdefault("required_credentials", [])
+        return result
+    except Exception as exc:
+        log.warning("LLM plan failed: %s", exc)
+        return _fallback_plan(repo_ctx, analysis)
+
+
+def _fallback_plan(repo_ctx: dict, analysis: dict) -> dict:
+    """Heuristic fallback when LLM call fails."""
+    entry = (
+        analysis.get("entry_point")
+        or next(
+            (f for f in repo_ctx.get("entry_candidates", []) if f), "main.py"
+        )
+    )
+    # If no entry point and only setup files → probably a library
+    setup_only = (
+        not repo_ctx.get("entry_candidates")
+        and any(f in repo_ctx.get("setup_files", []) for f in
+                ["setup.py", "pyproject.toml"])
+    )
+    return {
+        "summary":              "LLM analysis unavailable — using heuristics.",
+        "project_type":         "library" if setup_only else "script",
+        "runnable":             not setup_only,
+        "not_runnable_category": "pure_library" if setup_only else "",
+        "why_not_runnable":     "No executable entry point found; appears to be a library." if setup_only else "",
+        "what_user_needs":      ["Import the package in your own script."] if setup_only else [],
+        "workaround":           "pip install -e . && python -c 'import <package>'" if setup_only else "",
+        "uses_docker":          False,
+        "docker_command":       "",
+        "entry_point":          entry,
+        "run_command":          f"python {entry}",
+        "pre_run_steps":        [],
+        "install_command":      "pip install -r requirements.txt",
+        "env_vars":             {},
+        "required_credentials": [],
+        "credential_hints":     {},
+        "extra_deps":           [],
+        "known_issues":         [],
+        "quickstart_steps":     [f"python {entry}"],
+        "notes":                "",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LLM Diagnosis  (per failed attempt)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _llm_diagnose(
+    run_cmd:       str,
+    run_output:    str,
+    attempt:       int,
+    error_class:   str,
+    task:          str,
+    workspace:     str,
+    venv_path:     str,
+    repo_ctx:      dict,
+    file_contents: dict[str, str],
+    fix_journal:   list[dict],
+    metrics:       dict,
+) -> dict:
+    journal_summary = _summarise_journal(fix_journal)
+
+    # Source files mentioned in traceback
+    error_files = re.findall(r'File "([^"]+\.py)"', run_output)
+    relevant: dict[str, str] = {}
+    for ef in error_files[:3]:
+        basename = os.path.basename(ef)
+        for kp, content in file_contents.items():
+            if os.path.basename(kp) == basename:
+                relevant[kp] = content[:800]
+                break
+
+    extra_context = ""
+
+    if error_class == "missing_argument":
+        help_output = await _fetch_help_output(run_cmd, workspace, venv_path)
+        if help_output:
+            extra_context = (
+                f"\n━━━━ --help OUTPUT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{help_output[:3000]}\n\n"
+                f"TASK (use to infer argument values): {task}\n\n"
+                f"INSTRUCTION: Build a revised_command supplying ALL required "
+                f"options with sensible values inferred from the task description. "
+                f"For text/topic options use the task as value. "
+                f"For file paths use './outputs/' as output dir. "
+                f"For model/size options pick the smallest/fastest default."
+            )
+        else:
+            extra_context = (
+                f"\nNOTE: Missing-argument error. Task: '{task}'. "
+                f"Build a revised_command with required args from the task."
+            )
+
+    if AUTOFIX_PATTERNS["api_change"].search(run_output):
+        m   = AUTOFIX_PATTERNS["api_change"].search(run_output)
+        sym = m.group(1) if m else ""
+        extra_context += (
+            f"\nNOTE: '{sym}' was removed/renamed. "
+            f"Fix: pin an older version (e.g. 'package<X.Y')."
+        )
+
+    prompt = f"""A Python project run command failed. Diagnose the ROOT CAUSE and give a precise fix.
+
+FAILED COMMAND:
+{run_cmd}
+
+ERROR OUTPUT:
+{run_output[:3000]}
+{extra_context}
+
+RELEVANT SOURCE FILES:
+{json.dumps(relevant, indent=2)[:1500] if relevant else "(none)"}
+
+REPO FILE TREE: {repo_ctx['tree'][:25]}
+ATTEMPT: {attempt + 1}/{MAX_RETRIES}
+
+FIX JOURNAL (do NOT repeat these):
+{journal_summary}
+
+Return ONLY valid JSON — no markdown:
+{{
+  "fix_type": "install_package|set_env_var|create_file|fix_command|other",
+  "root_cause": "Exact root cause in one clear sentence",
+  "explanation": "What this fix does and why (2-3 sentences)",
+  "detail": "Exact fix detail",
+  "packages_to_install": ["pkg==version"],
+  "env_vars_to_set": {{"KEY": "value"}},
+  "files_to_create": [{{"path": "rel/path", "content": "file content"}}],
+  "revised_command": "complete corrected shell command if fix_command, else empty"
+}}"""
+
+    try:
+        raw = await llm_chat(
+            system=(
+                "You are a Python debugging expert. "
+                "Identify the exact root cause and provide a working fix. "
+                "For missing-argument errors, read --help carefully and build "
+                "a complete revised_command with all required options. "
+                "Return ONLY valid JSON. No markdown."
+            ),
+            user=prompt,
+            max_tokens=1500,
+            metrics=metrics,
+            temperature=0.1,
+        )
+        return _parse_json(raw)
+    except Exception as exc:
+        log.warning("LLM diagnosis failed: %s", exc)
+        return {
+            "fix_type":            "unknown",
+            "root_cause":          str(exc),
+            "explanation":         str(exc),
+            "detail":              "",
+            "packages_to_install": [],
+            "env_vars_to_set":     {},
+            "files_to_create":     [],
+            "revised_command":     "",
+        }
+
+
+async def _fetch_help_output(run_cmd: str, workspace: str, venv_path: str) -> str:
+    """Run the failed command with --help and return its output."""
+    base = re.sub(r"^mkdir\s+-p\s+\S+\s*&&\s*", "", run_cmd.strip())
+    base = re.sub(r"^yes\s*\|\s*bash\s+-c\s+", "", base).strip("'\"")
+    base = re.sub(r"^timeout\s+\d+\s+", "", base).strip()
+    if not re.match(r"python|python3|\.py", base, re.I):
+        return ""
+    help_cmd = base + " --help"
+    _, out   = await _run_cmd(["bash", "-c", help_cmd], workspace, timeout=15)
+    return out.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Run Script Generator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _generate_run_script(
+    repo_full_name:   str,
+    task:             str,
+    llm_plan:         dict,
+    pm_info:          dict,
+    env_hints:        dict,
+    run_cmd:          str,
+    pre_steps:        list[str],
+    env_export_lines: list[str],
+    final_rc:         int,
+    workspace:        Optional[str],
+) -> str:
+    repo_name      = repo_full_name.split("/")[-1]
+    status_tag     = "SUCCESS" if final_rc == 0 else "ATTEMPTED (may need adjustments)"
+    required_creds = llm_plan.get("required_credentials", [])
+    env_vars       = llm_plan.get("env_vars", {})
+    known_issues   = llm_plan.get("known_issues", [])
+    qs_steps       = llm_plan.get("quickstart_steps", [])
+    notes          = llm_plan.get("notes", "")
+    uses_docker    = llm_plan.get("uses_docker") or "docker" in run_cmd.lower()
+
+    lines = [
+        "#!/usr/bin/env bash",
+        "# ================================================================",
+        "#  RepoRunner — Auto-Generated Execution Script",
+        f"#  Repository : {repo_full_name}",
+        f"#  Task       : {task}",
+        f"#  Status     : {status_tag}",
+        "# ================================================================",
+        "set -euo pipefail",
+        "",
+        "# ── Step 1: Clone ─────────────────────────────────────────────────",
+        f'git clone --depth 1 "https://github.com/{repo_full_name}.git" "{repo_name}"',
+        f'cd "{repo_name}"',
+        "",
+    ]
+
+    if uses_docker:
+        lines += [
+            "# ── Step 2: Docker setup ─────────────────────────────────────────",
+            "# Ensure Docker is running: docker info",
+            "mkdir -p outputs",
+            "",
+        ]
+    else:
+        lines += [
+            "# ── Step 2: Virtual environment ──────────────────────────────────",
+            "python3 -m venv .venv",
+            "source .venv/bin/activate",
+            "pip install --upgrade pip --quiet",
+            "",
+            "# ── Step 3: Install dependencies ─────────────────────────────────",
+        ]
+        pm   = pm_info.get("name", "pip-req")
+        pmf  = pm_info.get("file", "requirements.txt")
+        if pm == "poetry"  and shutil.which("poetry"):
+            lines.append("poetry install --no-interaction")
+        elif pm == "pipenv" and shutil.which("pipenv"):
+            lines.append("pipenv install --skip-lock")
+        elif pm == "uv"     and shutil.which("uv"):
+            lines.append("uv sync")
+        elif pm == "conda":
+            lines.append(f"conda env update -f {pmf}")
+        elif pmf.endswith(".txt"):
+            lines.append(f"pip install -r {pmf}")
+        elif pmf in ("setup.py", "pyproject.toml", "setup.cfg"):
+            lines.append("pip install -e .")
+        else:
+            lines.append(
+                "pip install -r requirements.txt 2>/dev/null || "
+                "pip install -e . 2>/dev/null || true"
+            )
+        lines.append("")
+
+    # Credentials
+    all_creds: dict[str, str] = {}
+    for k in required_creds:
+        all_creds[k] = env_vars.get(k, "")
+    for k, v in env_vars.items():
+        if k not in all_creds:
+            all_creds[k] = v
+
+    has_unfilled = any(
+        not v or str(v).upper() in ("YOUR_VALUE_HERE", "REPLACE_ME", "")
+        for v in all_creds.values()
+    )
+
+    if all_creds:
+        lines += ["# ── Step 4: Environment variables ────────────────────────────────"]
+        if has_unfilled:
+            lines.append("# ⚠  Fill in REQUIRED values before running!")
+        hints = llm_plan.get("credential_hints", {})
+        for k, v in all_creds.items():
+            hint    = hints.get(k, "")
+            comment = f"  # ← {hint}" if hint else (
+                "  # ← REQUIRED" if k in required_creds else "  # ← optional")
+            if not v or str(v).upper() in ("YOUR_VALUE_HERE", "REPLACE_ME", ""):
+                lines.append(f'export {k}=""{comment}')
+            else:
+                lines.append(f'export {k}="{v}"{comment}')
+        for k, v in env_hints.items():
+            if k not in all_creds:
+                lines.append(f'# export {k}="{v}"   # hint from .env.example')
+        lines.append("")
+    elif env_export_lines:
+        lines += (
+            ["# ── Step 4: Environment variables ────────────────────────────────"]
+            + env_export_lines + [""]
+        )
+
+    step_n = 5
+    if pre_steps:
+        lines += [f"# ── Step {step_n}: Pre-run setup ─────────────────────────────────────"]
+        for step in pre_steps:
+            lines.append(step)
+        lines.append("")
+        step_n += 1
+
+    lines += [
+        f"# ── Step {step_n}: Run ────────────────────────────────────────────────",
+        "mkdir -p outputs",
+        run_cmd,
+        "",
+    ]
+
+    if known_issues:
+        lines += ["# ── Known issues ─────────────────────────────────────────────────"]
+        for issue in known_issues:
+            lines.append(f"# {issue}")
+        lines.append("")
+
+    if notes:
+        lines += ["# ── Notes ────────────────────────────────────────────────────────",
+                  f"# {notes}", ""]
+
+    if qs_steps and len(qs_steps) > 1:
+        lines += ["# ── README Quick Start (reference) ───────────────────────────────"]
+        for s in qs_steps[:8]:
+            lines.append(f"# {s}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Success Summary
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _build_success_summary(
+    task:          str,
+    repo:          str,
+    iteration_log: list,
+    fix_journal:   list,
+    run_cmd:       str,
+    stdout:        str,
+    metrics:       dict,
+) -> str:
+    autofix = sum(1 for f in fix_journal if f.get("result") == "autofix_applied")
+    llm_fix = sum(1 for f in fix_journal if f.get("result") == "llm_fix_applied")
+    prompt  = (
+        f"Summarise this successful execution in 2-3 sentences.\n"
+        f"Task: {task}\nRepo: {repo}\n"
+        f"Iterations: {len(iteration_log)} | "
+        f"Auto-fixes: {autofix} | LLM fixes: {llm_fix}\n"
+        f"Final command: {run_cmd}\n"
+        f"Output (first 600 chars):\n{stdout[:600]}"
+    )
+    try:
+        return await llm_chat(
+            system="Write a concise, helpful execution summary. No markdown.",
+            user=prompt, max_tokens=200, metrics=metrics, temperature=0.2)
+    except Exception:
+        return (
+            f"✅ Completed in {len(iteration_log)} attempt(s). "
+            f"Auto-fixes: {autofix} | LLM fixes: {llm_fix}. "
+            f"Command: {run_cmd}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Failure Guide
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _build_failure_guide(
+    task:           str,
+    repo_full_name: str,
+    iteration_log:  list,
+    fix_journal:    list,
+    run_cmd:        str,
+    stdout:         str,
+    stderr:         str,
+    llm_plan:       dict,
+    metrics:        dict,
+) -> tuple[str, str]:
+    error_msg      = _error_summary(stderr, stdout)
+    required_creds = llm_plan.get("required_credentials", [])
+    why_not        = llm_plan.get("why_not_runnable", "")
+    known_issues   = llm_plan.get("known_issues", [])
+    qs_steps       = llm_plan.get("quickstart_steps", [])
+    repo_name      = repo_full_name.split("/")[-1]
+
+    prompt = f"""A GitHub repository failed to run after {len(iteration_log)} automated attempts.
+Write a clear failure analysis and manual run guide.
+
+Repo        : {repo_full_name}
+Task        : {task}
+Final cmd   : {run_cmd}
+Final error : {error_msg}
+Why not run : {why_not}
+Required    : {required_creds}
+Known issues: {known_issues}
+Fix journal : {_summarise_journal(fix_journal)}
+Stdout tail : {stdout[-500:]}
+Stderr tail : {stderr[-500:]}
+
+Return ONLY valid JSON:
+{{
+  "failure_reason": "Clear 1-sentence root cause",
+  "category": "missing_credentials|missing_data|gpu_required|build_error|incompatible|other",
+  "what_you_need": ["Item 1", "Item 2"],
+  "manual_steps": ["Step 1: ...", "Step 2: ..."],
+  "suggested_command": "best guess at a working command",
+  "one_line_summary": "Short failure summary for the UI header"
+}}"""
+
+    try:
+        raw  = await llm_chat(
+            system="You are a Python debugging expert. Return ONLY valid JSON.",
+            user=prompt, max_tokens=1000, metrics=metrics, temperature=0.2)
+        data = _parse_json(raw)
+    except Exception:
+        data = {
+            "failure_reason":    error_msg or "Unknown error",
+            "category":          "other",
+            "what_you_need":     ([f"Provide: {', '.join(required_creds)}"]
+                                  if required_creds else []),
+            "manual_steps":      [f"Run: {run_cmd}"],
+            "suggested_command": run_cmd,
+            "one_line_summary":  f"Failed after {len(iteration_log)} attempts: {error_msg}",
+        }
+
+    md: list[str] = [
+        "## ❌ Automated Execution Failed",
+        "",
+        f"**Repository:** `{repo_full_name}`  ",
+        f"**Root cause:** {data.get('failure_reason', 'Unknown')}",
+        "",
+    ]
+
+    if data.get("what_you_need"):
+        md += ["### What You Need", ""]
+        for item in data["what_you_need"]:
+            md.append(f"- {item}")
+        md.append("")
+
+    if required_creds:
+        md += ["### Required Credentials", ""]
+        hints = llm_plan.get("credential_hints", {})
+        for cred in required_creds:
+            hint = hints.get(cred, "")
+            md.append(f"- `{cred}`" + (f" — {hint}" if hint else "")
+                      + f"\n  `export {cred}=\"your_value\"`")
+        md.append("")
+
+    if known_issues:
+        md += ["### Known Issues", ""]
+        for issue in known_issues:
+            md.append(f"- {issue}")
+        md.append("")
+
+    md += ["### Manual Steps", "", "```bash"]
+    md.append(f"git clone --depth 1 https://github.com/{repo_full_name}.git {repo_name}")
+    md.append(f"cd {repo_name}")
+    md.append("python3 -m venv .venv && source .venv/bin/activate")
+    md.append("pip install -r requirements.txt")
+    if required_creds:
+        for c in required_creds:
+            md.append(f'export {c}="YOUR_{c}_HERE"')
+    for step in data.get("manual_steps", [])[:8]:
+        md.append(f"# {step}")
+    suggested = data.get("suggested_command", run_cmd)
+    if suggested:
+        md.append(suggested)
+    md += ["```", ""]
+
+    if fix_journal:
+        md += ["### Attempts Made (Auto-Fix Journal)", ""]
+        for entry in fix_journal[:6]:
+            expl = (entry.get("explanation") or entry.get("root_cause") or "")[:80]
+            md.append(
+                f"- Attempt {entry.get('attempt', '?')}: "
+                f"`{entry.get('fix_type', '?')}` — {expl}"
+            )
+        md.append("")
+
+    one_line     = data.get("one_line_summary",
+                            f"❌ Failed after {len(iteration_log)} attempts: {error_msg}")
+    manual_guide = "\n".join(md)
+    return one_line, manual_guide
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Clone
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _clone_repo(repo_full_name: str, metrics: dict,
+                      max_attempts: int = 3) -> str:
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        url = f"https://{token}@github.com/{repo_full_name}.git"
+    else:
+        url = f"https://github.com/{repo_full_name}.git"
+    log_url  = f"https://github.com/{repo_full_name}.git"
+    git_env  = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo"}
+    last_err = ""
+
+    for attempt in range(1, max_attempts + 1):
+        workspace = tempfile.mkdtemp(prefix="executor_")
+        log.info("Cloning %s → %s (attempt %d/%d)", log_url, workspace, attempt, max_attempts)
+        proc = await asyncio.create_subprocess_exec(
+            "git", "clone", "--depth", "1", url, workspace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=git_env,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            shutil.rmtree(workspace, ignore_errors=True)
+            last_err = "git clone timed out after 120s"
+            if attempt < max_attempts:
+                await asyncio.sleep(5)
+            continue
+
+        if proc.returncode == 0:
+            return workspace
+
+        last_err = stderr.decode(errors="ignore")[:600]
+        shutil.rmtree(workspace, ignore_errors=True)
+        log.warning("Clone attempt %d failed: %s", attempt, last_err[:120])
+        if attempt < max_attempts:
+            await asyncio.sleep(5 * attempt)   # 5s, 10s back-off
+
+    raise RuntimeError(f"git clone failed after {max_attempts} attempts: {last_err}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Workspace Inspection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _inspect_workspace(workspace: str) -> dict:
+    skip = {
+        ".git", ".venv", "__pycache__", "node_modules",
+        ".tox", ".eggs", "dist", "build", ".mypy_cache",
+    }
+    tree, setup_files, key_sources = [], [], []
+    total = 0
+
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = sorted(d for d in dirs if d not in skip)
+        for f in files:
+            total += 1
+            rel = os.path.relpath(os.path.join(root, f), workspace)
+            tree.append(rel)
+            fl  = f.lower()
+            if fl in {
+                "requirements.txt", "requirements-dev.txt",
+                "pyproject.toml", "setup.py", "setup.cfg",
+                "environment.yml", "pipfile", "pipfile.lock",
+                "uv.lock", "poetry.lock",
+                ".env.example", ".env.sample", ".env.template",
+                "makefile", "dockerfile",
+                "docker-compose.yml", "docker-compose.yaml",
+            }:
+                setup_files.append(rel)
+            if fl.endswith(".py") or fl.endswith(".ipynb"):
+                key_sources.append(rel)
+
+    readme_text = ""
+    for rname in ("README.md", "README.rst", "README.txt", "README"):
+        rp = os.path.join(workspace, rname)
+        if os.path.isfile(rp):
+            try:
+                readme_text = Path(rp).read_text(
+                    encoding="utf-8", errors="ignore")[:5000]
+            except Exception:
+                pass
+            break
+
+    entry_kw = (
+        "main", "app", "run", "cli", "demo",
+        "inference", "__main__", "server", "start", "predict",
+    )
+    entry_candidates = [
+        f for f in key_sources
+        if any(k in os.path.basename(f).lower() for k in entry_kw)
+    ]
+
+    source_snippets: dict[str, str] = {}
+    for fp in (entry_candidates or key_sources)[:6]:
+        try:
+            txt = Path(os.path.join(workspace, fp)).read_text(
+                encoding="utf-8", errors="ignore")
+            source_snippets[fp] = "\n".join(txt.splitlines()[:100])
+        except Exception:
+            pass
+
+    summary = (
+        f"{total} files | setup: {setup_files or 'none'} | "
+        f"py sources: {len(key_sources)} | "
+        f"entry candidates: "
+        f"{[os.path.basename(f) for f in entry_candidates[:5]]}"
+    )
+    return {
+        "tree":             tree[:100],
+        "file_count":       total,
+        "setup_files":      setup_files,
+        "key_sources":      key_sources[:30],
+        "entry_candidates": entry_candidates[:10],
+        "source_snippets":  source_snippets,
+        "readme":           readme_text,
+        "summary":          summary,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Package Manager
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_package_manager(workspace: str) -> dict:
+    for name, marker, cmd in PKG_MANAGERS:
+        if os.path.isfile(os.path.join(workspace, marker)):
+            return {"name": name, "file": marker, "cmd": cmd}
+    return {"name": "pip-bare", "file": "none", "cmd": None}
+
+
+def _pip_path(venv_path: str) -> str:
+    if sys.platform == "win32":
+        return os.path.join(venv_path, "Scripts", "pip.exe")
+    return os.path.join(venv_path, "bin", "pip")
+
+
+def _python_path(venv_path: str) -> str:
+    if sys.platform == "win32":
+        return os.path.join(venv_path, "Scripts", "python.exe")
+    return os.path.join(venv_path, "bin", "python")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Environment Setup
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _setup_environment(
+    workspace: str,
+    venv_path: str,
+    pm_info:   dict,
+    metrics:   dict,
+) -> tuple[bool, str]:
+    parts: list[str] = []
+
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "venv", venv_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        return False, "venv creation timed out"
+    if proc.returncode != 0:
+        return False, f"venv creation failed: {err.decode()[:300]}"
+    parts.append("✓ Virtual environment created")
+
+    pip = _pip_path(venv_path)
+    await _run_cmd([pip, "install", "--upgrade", "pip", "--quiet"], workspace, timeout=60)
+
+    pm_name = pm_info["name"]
+    ok = True
+
+    if pm_name == "uv" and shutil.which("uv"):
+        ok, out = await _run_cmd(["uv", "sync"], workspace, timeout=300)
+        parts += [f"{'✓' if ok else '⚠'} uv sync", out[-600:]]
+
+    elif pm_name == "poetry" and shutil.which("poetry"):
+        ok, out = await _run_cmd(
+            ["poetry", "install", "--no-interaction"], workspace, timeout=300)
+        parts += [f"{'✓' if ok else '⚠'} poetry install", out[-600:]]
+
+    elif pm_name == "pipenv" and shutil.which("pipenv"):
+        ok, out = await _run_cmd(
+            ["pipenv", "install", "--skip-lock"], workspace, timeout=300)
+        parts += [f"{'✓' if ok else '⚠'} pipenv install", out[-600:]]
+
+    else:
+        installed = False
+        for fname, install_cmd in [
+            ("requirements.txt",     [pip, "install", "-r", "requirements.txt"]),
+            ("requirements-dev.txt", [pip, "install", "-r", "requirements-dev.txt"]),
+            ("pyproject.toml",       [pip, "install", "."]),
+            ("setup.py",             [pip, "install", "-e", "."]),
+            ("setup.cfg",            [pip, "install", "."]),
+        ]:
+            if os.path.isfile(os.path.join(workspace, fname)):
+                r, out = await _run_cmd(install_cmd, workspace, timeout=300)
+                parts += [f"{'✓' if r else '⚠'} {' '.join(install_cmd[-2:])}", out[-600:]]
+                installed = True
+        if not installed:
+            parts.append("⚠ No dependency file found — proceeding bare")
+
+    return ok, "\n".join(filter(None, parts))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Env-var Discovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _discover_env_hints(workspace: str) -> dict[str, str]:
+    hints: dict[str, str] = {}
+    for fname in (".env.example", ".env.sample", ".env.template", ".env.default"):
+        fp = os.path.join(workspace, fname)
+        if os.path.isfile(fp):
+            try:
+                for line in Path(fp).read_text(
+                        encoding="utf-8", errors="ignore").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, _, v = line.partition("=")
+                        hints[k.strip()] = v.strip()
+            except Exception:
+                pass
+    return hints
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Run Command Builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_run_command(
+    llm_plan:    dict,
+    analysis:    dict,
+    repo_ctx:    dict,
+    input_files: list[str],
+    workspace:   str,
+    readme_cmds: dict,
+) -> tuple[str, str]:
+    """
+    Returns (run_command, source_description).
+    Priority: Docker > README primary > LLM plan > static analysis > heuristic.
+    """
+    ws = Path(workspace)
+
+    # 1. Docker
+    has_compose    = (ws / "docker-compose.yml").exists() or (ws / "docker-compose.yaml").exists()
+    has_dockerfile = (ws / "Dockerfile").exists()
+
+    if llm_plan.get("uses_docker") or has_compose or has_dockerfile:
+        llm_docker = llm_plan.get("docker_command", "").strip()
+        if has_compose:
+            if llm_docker and "docker" in llm_docker:
+                return _inject_inputs(llm_docker, input_files), "Docker (LLM)"
+            if shutil.which("docker-compose"):
+                return _inject_inputs("docker-compose up --build", input_files), "Docker (compose)"
+            if shutil.which("docker"):
+                return _inject_inputs("docker compose up --build", input_files), "Docker (plugin)"
+        if has_dockerfile and shutil.which("docker"):
+            if llm_docker and "docker" in llm_docker:
+                return _inject_inputs(llm_docker, input_files), "Docker (LLM)"
+            safe_tag     = re.sub(r"[^a-z0-9._-]", "-", ws.name.lower())[:40] or "repo-app"
+            input_mount  = ""
+            if input_files:
+                first       = input_files[0]
+                first_path  = first if first.startswith("inputs/") else f"inputs/{first}"
+                input_mount = f' -v "$(pwd)/{first_path}:/{first_path}"'
+            cmd = (
+                f'docker build -t {safe_tag} . && '
+                f'docker run --rm{input_mount} '
+                f'-v "$(pwd)/outputs:/outputs" {safe_tag}'
+            )
+            return cmd, "Docker (Dockerfile)"
+
+    # 2. README primary command
+    readme_primary = readme_cmds.get("primary_cmd", "").strip()
+    if readme_primary and _is_valid_shell_cmd(readme_primary):
+        return (
+            f"mkdir -p outputs && {_inject_inputs(readme_primary, input_files)}",
+            "README (primary command)",
+        )
+
+    # 3. Any README run command
+    for rc in readme_cmds.get("run_cmds", []):
+        if _is_valid_shell_cmd(rc):
+            return (
+                f"mkdir -p outputs && {_inject_inputs(rc, input_files)}",
+                "README (run_cmds)",
+            )
+
+    # 4. LLM plan
+    cmd = llm_plan.get("run_command", "").strip()
+    if cmd and _is_valid_shell_cmd(cmd):
+        return (
+            f"mkdir -p outputs && {_inject_inputs(cmd, input_files)}",
+            "LLM analysis",
+        )
+
+    # 5. Static analyzer
+    raw = (analysis.get("run_command") or "").strip()
+    if raw and _is_valid_shell_cmd(raw):
+        return (
+            f"mkdir -p outputs && {_inject_inputs(raw, input_files)}",
+            "static analysis",
+        )
+
+    # 6. Entry-point heuristic
+    entry = (
+        llm_plan.get("entry_point")
+        or analysis.get("entry_point")
+        or next((f for f in repo_ctx.get("entry_candidates", []) if f), "")
+    )
+    if entry:
+        return (
+            f"mkdir -p outputs && {_inject_inputs(_cmd_for_entry(entry), input_files)}",
+            f"heuristic entry point ({entry})",
+        )
+
+    # 7. Last resort
+    for src in repo_ctx.get("key_sources", []):
+        if src.endswith((".py", ".ipynb")):
+            return (
+                f"mkdir -p outputs && {_inject_inputs(_cmd_for_entry(src), input_files)}",
+                f"fallback ({src})",
+            )
+
+    return "mkdir -p outputs && python main.py", "last resort fallback"
+
+
+def _is_valid_shell_cmd(cmd: str) -> bool:
+    if not cmd:
+        return False
+    first = cmd.split()[0].lower().rstrip(":")
+    NOT_COMMANDS = {
+        "run", "execute", "start", "launch", "open", "use", "the", "a", "an",
+        "to", "in", "with", "and", "or", "for", "this", "that", "then",
+        "just", "simply", "first", "next", "finally", "note", "example",
+    }
+    return first not in NOT_COMMANDS
+
+
+def _cmd_for_entry(entry: str) -> str:
+    if entry.endswith(".ipynb"):
+        py = entry.replace(".ipynb", ".py")
+        return f"jupyter nbconvert --to script '{entry}' && python '{py}'"
+    if entry.endswith(".py"):
+        return f"python '{entry}'"
+    if entry.endswith(".sh"):
+        return f"bash '{entry}'"
+    return f"python '{entry}'"
+
+
+def _inject_inputs(cmd: str, input_files: list[str]) -> str:
+    if not input_files:
+        return cmd
+    first      = input_files[0]
+    first_path = first if first.startswith("inputs/") else f"inputs/{first}"
+    for ph in ("{input}", "{input_path}", "{image}", "{file}",
+               "INPUT_PATH", "INPUT_FILE", "INPUT_IMAGE"):
+        if ph in cmd:
+            return cmd.replace(ph, first_path, 1)
+    if "--input" not in cmd and "--image" not in cmd and "--img" not in cmd:
+        cmd += f" --input {first_path}"
+    return cmd
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Direct Command Runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _run_direct(
+    run_cmd:   str,
+    workspace: str,
+    venv_path: str,
+) -> tuple[int, str, str]:
+    activate     = f'source "{venv_path}/bin/activate"' if venv_path else ""
+    shell_script = (
+        "#!/bin/bash\n"
+        "set -o pipefail\n"
+        "export PYTHONIOENCODING=utf-8\n"
+        "export PYTHONDONTWRITEBYTECODE=1\n"
+        + (f'set +u\n{activate}\nset -u\n' if activate else "")
+        + f'cd "{workspace}"\n'
+        + f"timeout {SCRIPT_TIMEOUT} bash -c {shlex.quote(run_cmd)}\n"
+    )
+    tmp = Path(workspace) / ".run_direct.sh"
+    tmp.write_text(shell_script, encoding="utf-8")
+    tmp.chmod(0o755)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bash", str(tmp), cwd=workspace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={
+                **os.environ,
+                "PYTHONPATH":  workspace,
+                "HOME":        os.environ.get("HOME", "/tmp"),
+                "MPLBACKEND":  "Agg",   # render to file, never open a GUI window
+            },
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=SCRIPT_TIMEOUT + 10)
+        return (
+            proc.returncode,
+            stdout.decode(errors="ignore")[:6000],
+            stderr.decode(errors="ignore")[:6000],
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return 1, "", f"Command timed out after {SCRIPT_TIMEOUT}s"
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Error Classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _classify_error(output: str) -> str:
+    if AUTOFIX_PATTERNS["interactive_prompt"].search(output):
+        return "interactive_prompt"
+    if AUTOFIX_PATTERNS["missing_argument"].search(output):
+        return "missing_argument"
+    if AUTOFIX_PATTERNS["api_change"].search(output):
+        return "api_change"
+    if AUTOFIX_PATTERNS["missing_module"].search(output):
+        return "missing_module"
+    if AUTOFIX_PATTERNS["cuda_error"].search(output):
+        return "cuda_error"
+    if AUTOFIX_PATTERNS["port_in_use"].search(output):
+        return "port_in_use"
+    if AUTOFIX_PATTERNS["permission"].search(output):
+        return "permission_error"
+    for cls, pattern in AUTOFIX_PATTERNS.items():
+        if cls in ("api_change", "missing_module", "interactive_prompt",
+                   "cuda_error", "missing_argument", "port_in_use", "permission"):
+            continue
+        if pattern.search(output):
+            return cls
+    if "SyntaxError"  in output: return "syntax_error"
+    if "MemoryError"  in output: return "memory_error"
+    if "ConnectionError" in output: return "network_error"
+    return "runtime_error"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Auto-fix  (no LLM call)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _try_autofix(
+    error_class: str,
+    output:      str,
+    workspace:   str,
+    venv_path:   str,
+    fix_journal: list[dict] | None = None,
+) -> Optional[dict]:
+    already_tried: set[str] = set()
+    for entry in (fix_journal or []):
+        detail   = entry.get("detail", "")
+        fix_type = entry.get("fix_type", "")
+        if "pip install" in str(detail):
+            already_tried.add(str(detail).split("pip install")[-1].strip().lower())
+        if fix_type:
+            already_tried.add(fix_type)
+
+    if error_class == "missing_module" and venv_path:
+        m = AUTOFIX_PATTERNS["missing_module"].search(output)
+        if m:
+            import_name = m.group(1)
+            pkg         = IMPORT_TO_PYPI.get(import_name, import_name)
+            if pkg.lower() not in already_tried:
+                pip = _pip_path(venv_path)
+                ok, _ = await _run_cmd([pip, "install", pkg], workspace, timeout=120)
+                if ok:
+                    return {
+                        "fix_type":    "install_package",
+                        "explanation": f"Auto-installed missing package: '{pkg}'",
+                        "detail":      f"pip install {pkg}",
+                    }
+
+    if error_class == "api_change":
+        return None  # needs LLM for version pinning
+
+    if error_class == "interactive_prompt":
+        if "pipe_yes" not in already_tried:
+            import glob
+            for d in glob.glob(os.path.expanduser("~/.cookiecutters/*")):
+                try:
+                    shutil.rmtree(d)
+                except Exception:
+                    pass
+            return {
+                "fix_type":       "pipe_yes",
+                "explanation":    "Cleared cached templates; auto-answering y/n prompts.",
+                "detail":         "pipe_yes",
+                "revised_command": None,
+            }
+        return None
+
+    if error_class == "bad_encoding":
+        os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+        return {
+            "fix_type":    "env_set",
+            "explanation": "Set PYTHONIOENCODING=utf-8",
+            "detail":      "PYTHONIOENCODING=utf-8",
+        }
+
+    if error_class == "port_in_use":
+        # Try a different port
+        import shlex
+        new_port = "8001"
+        return {
+            "fix_type":       "fix_command",
+            "explanation":    f"Original port in use — trying port {new_port}",
+            "detail":         f"--port {new_port}",
+            "revised_command": None,  # LLM will handle this
+        }
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Apply Fix
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _apply_fix(fix: dict, workspace: str, venv_path: str):
+    pip = _pip_path(venv_path) if venv_path else "pip"
+
+    for pkg in fix.get("packages_to_install", [])[:10]:
+        pkg = _sanitise(str(pkg))
+        if pkg and venv_path:
+            await _run_cmd([pip, "install", pkg], workspace, timeout=120)
+
+    env_vars = fix.get("env_vars_to_set", {})
+    if isinstance(env_vars, dict):
+        for k, v in env_vars.items():
+            if k:
+                os.environ[str(k)] = str(v)
+
+    for file_spec in fix.get("files_to_create", [])[:5]:
+        try:
+            rel_path = _sanitise_path(file_spec.get("path", ""))
+            content  = file_spec.get("content", "")
+            if rel_path and content:
+                full_path = Path(workspace) / rel_path
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                full_path.write_text(content, encoding="utf-8")
+                log.info("Created file: %s", rel_path)
+        except Exception as exc:
+            log.warning("Failed to create file: %s", exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Input File Injection
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _inject_input_files(
+    workspace:   str,
+    input_files: list[str],
+    job_id:      str,
+) -> list[str]:
+    inputs_dir = Path(workspace) / "inputs"
+    inputs_dir.mkdir(exist_ok=True)
+    injected: list[str] = []
+
+    for fpath in input_files:
+        try:
+            if fpath.startswith(("http://", "https://")):
+                async with httpx.AsyncClient(timeout=120) as client:
+                    resp = await client.get(fpath, follow_redirects=True)
+                    resp.raise_for_status()
+                    if len(resp.content) > MAX_FILE_SIZE:
+                        continue
+                    fname = fpath.split("/")[-1].split("?")[0] or "download"
+                    dest  = inputs_dir / _sanitise_path(fname)
+                    dest.write_bytes(resp.content)
+                    injected.append(f"inputs/{dest.name}")
+            else:
+                src = Path(fpath)
+                if not src.is_absolute():
+                    src = Path(OUTPUT_ROOT) / job_id / "uploads" / fpath
+                if src.is_file() and src.stat().st_size <= MAX_FILE_SIZE:
+                    dest = inputs_dir / src.name
+                    shutil.copy2(str(src), str(dest))
+                    injected.append(f"inputs/{dest.name}")
+        except Exception as exc:
+            log.warning("Failed to inject %s: %s", fpath, exc)
+
+    return injected
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Output Capture
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _capture_outputs(workspace: str, job_id: str) -> list[str]:
+    job_dir = Path(OUTPUT_ROOT) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    ws      = Path(workspace)
+    captured: list[str] = []
+
+    def _copy(src: Path, dest_name: str) -> None:
+        try:
+            if src.is_file() and src.stat().st_size <= MAX_FILE_SIZE:
+                shutil.copy2(str(src), str(job_dir / dest_name))
+                captured.append(dest_name)
+        except Exception as exc:
+            log.warning("Failed to capture %s: %s", src, exc)
+
+    for fname in ("run_final.sh", "execution_output.txt", "execution_log.json"):
+        _copy(ws / fname, fname)
+
+    outputs_dir = ws / "outputs"
+    if outputs_dir.is_dir():
+        for fpath in sorted(outputs_dir.rglob("*")):
+            if fpath.is_file():
+                rel       = fpath.relative_to(outputs_dir)
+                dest_name = "__".join(rel.parts)
+                _copy(fpath, dest_name)
+
+    return captured
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _run_cmd(
+    cmd:     list,
+    cwd:     str,
+    timeout: int = 120,
+) -> tuple[bool, str]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        out = stdout.decode(errors="ignore") + stderr.decode(errors="ignore")
+        return proc.returncode == 0, out
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return False, "Command timed out"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _fmt_output(rc: int, stdout: str, stderr: str) -> str:
+    parts = []
+    if stdout.strip():
+        parts.append(f"STDOUT:\n{stdout.strip()}")
+    if stderr.strip():
+        parts.append(f"STDERR:\n{stderr.strip()}")
+    parts.append(f"EXIT CODE: {rc}")
+    return "\n".join(parts)
+
+
+def _error_summary(stderr: str, stdout: str) -> str:
+    for text in (stderr, stdout):
+        lines     = text.strip().splitlines()
+        err_lines = [
+            l for l in lines
+            if any(k in l.lower() for k in (
+                "error", "exception", "traceback",
+                "modulenotfounderror", "no module",
+                "importerror", "filenotfound",
+                "syntaxerror", "typeerror", "valueerror",
+            ))
+        ]
+        if err_lines:
+            return " | ".join(err_lines[-4:])[:600]
+    return "Script exited with non-zero code"
+
+
+def _summarise_journal(fix_journal: list[dict]) -> str:
+    if not fix_journal:
+        return "No fixes attempted yet."
+    return "\n".join(
+        f"  Attempt {e.get('attempt','?')}: "
+        f"fix_type={e.get('fix_type','?')} | "
+        f"result={e.get('result','?')} | "
+        f"detail={str(e.get('detail',''))[:100]}"
+        for e in fix_journal
+    )
+
+
+def _parse_json(text: str) -> dict:
+    text  = re.sub(r"```(?:json|python)?|```", "", text).strip()
+    start = text.find("{")
+    end   = text.rfind("}")
+    if start != -1 and end != -1:
+        return json.loads(text[start:end + 1])
+    raise ValueError(f"No JSON object found in: {text[:200]}")
+
+
+def _fresh_metrics() -> dict:
+    return {
+        "calls":         0,
+        "tokens":        0,
+        "iters":         0,
+        "files":         0,
+        "autofix_count": 0,
+        "llm_fix_count": 0,
+        "elapsed_s":     0.0,
+    }
+
+
+def _ev(
+    type_:   str,
+    title:   str,
+    body:    str,
+    code:    str  = "",
+    tool:    str  = "",
+    metrics: dict = None,
+    extra:   dict = None,
+) -> dict:
+    return {
+        "type":    type_,
+        "title":   title,
+        "body":    body,
+        "code":    code,
+        "tool":    tool,
+        "metrics": metrics or {},
+        **(extra or {}),
+    }
+
+
+def _sanitise(s: str) -> str:
+    return re.sub(r"[;&|`$<>\s\"'\\]", "", s)[:80]
+
+
+def _sanitise_path(s: str) -> str:
+    p     = Path(s)
+    parts = [
+        part for part in p.parts
+        if part not in ("", "/", "\\") and ".." not in part
+    ]
+    return str(Path(*parts)) if parts else ""
