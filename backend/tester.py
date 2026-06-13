@@ -12,7 +12,6 @@ Scanners (Python-only):
   types     — mypy (static type errors)
   secrets   — detect-secrets (leaked credentials / keys)
   deadcode  — vulture (unused functions / variables)
-  coverage  — pytest --cov (test coverage %, only when tests exist)
 """
 from __future__ import annotations
 
@@ -51,7 +50,6 @@ SCANNER_META = [
     {"id": "types",    "name": "Type Analysis",     "icon": "🔬", "tool": "mypy"},
     {"id": "secrets",  "name": "Secret Detection",  "icon": "🔑", "tool": "detect-secrets"},
     {"id": "deadcode", "name": "Dead Code",         "icon": "💀", "tool": "vulture"},
-    {"id": "coverage", "name": "Test Coverage",     "icon": "🧪", "tool": "pytest-cov"},
 ]
 
 
@@ -177,7 +175,6 @@ async def _run_scanner(scanner_id: str,
         "types":    _scan_types,
         "secrets":  _scan_secrets,
         "deadcode": _scan_deadcode,
-        "coverage": _scan_coverage,
     }
     fn = dispatch.get(scanner_id)
     return await fn(workspace, venv_path) if fn else []
@@ -366,54 +363,6 @@ async def _scan_deadcode(workspace: str, venv_path: str) -> list[dict]:
                 confidence=m.group(4) + "%",
             ))
     return findings[:300]
-
-
-# ── coverage ──────────────────────────────────────────────────────────────────
-
-async def _scan_coverage(workspace: str, venv_path: str) -> list[dict]:
-    # Only run if test files exist
-    has_tests = any(
-        (fname.startswith("test_") or fname.endswith("_test.py"))
-        for _, _, files in os.walk(workspace)
-        for fname in files
-        if fname.endswith(".py")
-    )
-    if not has_tests:
-        return [_finding(
-            scanner="coverage", severity="info",
-            file="", line=0, rule="no_tests",
-            message="No test files found (test_*.py / *_test.py)",
-        )]
-
-    pip = _pip(venv_path)
-    await _run([pip, "install", "pytest", "pytest-cov", "--quiet"],
-               workspace, timeout=90)
-    pytest = _tool(venv_path, "pytest")
-    ok, out = await _run(
-        [pytest, "--cov=.", "--cov-report=term-missing",
-         "-q", "--tb=no", "--no-header", "-x",
-         "--ignore=.audit_venv"],
-        workspace, timeout=TOOL_TIMEOUT)
-
-    for line in out.splitlines():
-        m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", line)
-        if m:
-            pct = int(m.group(1))
-            sev = ("high"   if pct < 50 else
-                   "medium" if pct < 70 else
-                   "low"    if pct < 85 else "info")
-            return [_finding(
-                scanner="coverage", severity=sev,
-                file="", line=0, rule="coverage",
-                message=f"Overall test coverage: {pct}%",
-                confidence=str(pct) + "%",
-            )]
-
-    return [_finding(
-        scanner="coverage", severity="info",
-        file="", line=0, rule="coverage",
-        message="Coverage data unavailable (tests may have failed)",
-    )]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

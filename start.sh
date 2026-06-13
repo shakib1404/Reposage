@@ -17,9 +17,17 @@ fi
 
 # Backend
 echo "▶ Starting backend (FastAPI on :8000)…"
+
+# Free port 8000 if occupied by a stale/unrelated process
+if lsof -ti:8000 > /dev/null 2>&1; then
+  echo "   ⚠  Port 8000 is in use — stopping it…"
+  kill $(lsof -ti:8000) 2>/dev/null
+  sleep 1
+fi
+
 cd backend
 pip install -r requirements.txt -q
-uvicorn main:app --reload --host 127.0.0.1 --port 8000 &
+uvicorn main:app --host 127.0.0.1 --port 8000 --workers 1 &
 BACKEND_PID=$!
 cd ..
 

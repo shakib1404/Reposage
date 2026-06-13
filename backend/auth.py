@@ -1,23 +1,25 @@
 """
 auth.py — Authentication & Authorization
 =========================================
-• bcrypt password hashing
+• bcrypt password hashing (offloaded to thread pool — never blocks event loop)
 • JWT access tokens (7-day expiry)
 • Password-reset tokens (1-hour expiry, stored in MongoDB)
 • Gmail SMTP for reset emails
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import os
 import secrets
 import smtplib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 
 import bcrypt as _bcrypt
-import hashlib
 
 from dotenv import load_dotenv
 from fastapi import Depends, HTTPException
@@ -28,6 +30,9 @@ from bson import ObjectId
 
 load_dotenv()
 
+# Thread pool dedicated to bcrypt so it never blocks the async event loop
+_bcrypt_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bcrypt")
+
 # ── Config ────────────────────────────────────────────────────────────────────
 MONGO_URL          = os.getenv("MONGO_URL", "")
 JWT_SECRET         = os.getenv("JWT_SECRET", "changeme")
@@ -36,7 +41,8 @@ GMAIL_PASS         = os.getenv("GMAIL_PASS", "")
 JWT_ALGORITHM      = "HS256"
 JWT_EXPIRE_DAYS    = 7
 RESET_EXPIRE_HOURS = 1
-DB_NAME            = "repomaster"   # database name — keep stable across UI renames
+DB_NAME            = "repomaster"
+BCRYPT_ROUNDS      = 10   # 10 ≈ 50ms; 12 ≈ 200ms — both are secure
 
 # ── MongoDB (shared client) ───────────────────────────────────────────────────
 _mongo_client: Optional[AsyncIOMotorClient] = None
@@ -44,25 +50,39 @@ _mongo_client: Optional[AsyncIOMotorClient] = None
 def get_db():
     global _mongo_client
     if _mongo_client is None:
-        _mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=8000)
+        _mongo_client = AsyncIOMotorClient(
+            MONGO_URL,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000,
+            maxPoolSize=10,
+            minPoolSize=1,
+        )
     return _mongo_client[DB_NAME]
 
 
-# ── Password hashing ──────────────────────────────────────────────────────────
-# Pre-hash with SHA-256 so bcrypt never sees a password > 72 bytes
-# (bcrypt 4+ raises ValueError for passwords that long).
+# ── Password hashing (runs in thread pool — never blocks event loop) ──────────
+# Pre-hash with SHA-256 so bcrypt never sees a password > 72 bytes.
 
 def _normalise(plain: str) -> bytes:
     return hashlib.sha256(plain.encode("utf-8")).digest()
 
-def hash_password(plain: str) -> str:
-    return _bcrypt.hashpw(_normalise(plain), _bcrypt.gensalt(rounds=12)).decode("utf-8")
+def _sync_hash(plain: str) -> str:
+    return _bcrypt.hashpw(_normalise(plain), _bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode("utf-8")
 
-def verify_password(plain: str, hashed: str) -> bool:
+def _sync_verify(plain: str, hashed: str) -> bool:
     try:
         return _bcrypt.checkpw(_normalise(plain), hashed.encode("utf-8"))
     except Exception:
         return False
+
+async def hash_password(plain: str) -> str:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_bcrypt_pool, _sync_hash, plain)
+
+async def verify_password(plain: str, hashed: str) -> bool:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_bcrypt_pool, _sync_verify, plain, hashed)
 
 
 # ── JWT ───────────────────────────────────────────────────────────────────────
@@ -122,17 +142,23 @@ async def get_optional_user(
 # ── User CRUD ─────────────────────────────────────────────────────────────────
 async def create_user(username: str, email: str, password: str) -> dict:
     db = get_db()
-    if await db["users"].find_one({"email": email.lower()}):
+    # Check duplicates and hash password concurrently
+    email_exists, username_exists, hashed = await asyncio.gather(
+        db["users"].find_one({"email": email.lower()}),
+        db["users"].find_one({"username": username}),
+        hash_password(password),
+    )
+    if email_exists:
         raise HTTPException(status_code=400, detail="Email already registered")
-    if await db["users"].find_one({"username": username}):
+    if username_exists:
         raise HTTPException(status_code=400, detail="Username already taken")
 
     doc = {
-        "username":    username,
-        "email":       email.lower(),
-        "password":    hash_password(password),
-        "created_at":  datetime.utcnow(),
-        "reset_token": None,
+        "username":      username,
+        "email":         email.lower(),
+        "password":      hashed,
+        "created_at":    datetime.utcnow(),
+        "reset_token":   None,
         "reset_expires": None,
     }
     result = await db["users"].insert_one(doc)
@@ -142,7 +168,9 @@ async def create_user(username: str, email: str, password: str) -> dict:
 async def authenticate_user(email: str, password: str) -> dict:
     db   = get_db()
     user = await db["users"].find_one({"email": email.lower()})
-    if not user or not verify_password(password, user["password"]):
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not await verify_password(password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     user["_id"] = str(user["_id"])
     return user
@@ -171,10 +199,11 @@ async def reset_password(token: str, new_password: str) -> bool:
         raise HTTPException(status_code=400, detail="Invalid reset token")
     if datetime.utcnow() > user.get("reset_expires", datetime.min):
         raise HTTPException(status_code=400, detail="Reset token expired")
+    hashed = await hash_password(new_password)
     await db["users"].update_one(
         {"_id": user["_id"]},
         {"$set": {
-            "password":      hash_password(new_password),
+            "password":      hashed,
             "reset_token":   None,
             "reset_expires": None,
         }},

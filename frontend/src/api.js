@@ -199,6 +199,49 @@ export function streamExecution(task, repoFullName, analysis, onEvent, jobId = '
   return () => controller.abort()
 }
 
+export function streamTaskExec(task, repoFullName, jobId, inputFile, onEvent) {
+  const controller = new AbortController()
+  const token      = getToken()
+
+  fetch(`${BASE}/taskexec`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({
+      task,
+      repo_full_name: repoFullName,
+      job_id:         jobId     || '',
+      input_file:     inputFile || '',
+    }),
+    signal: controller.signal,
+  }).then(async res => {
+    if (!res.ok) { onEvent({ type: 'error', message: await res.text() }); return }
+    const reader  = res.body.getReader()
+    const decoder = new TextDecoder()
+    let   buffer  = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop()
+      for (const part of parts) {
+        const line = part.trim()
+        if (line.startsWith('data: ')) {
+          try { onEvent(JSON.parse(line.slice(6))) } catch {}
+        }
+      }
+    }
+  }).catch(err => {
+    if (err.name !== 'AbortError')
+      onEvent({ type: 'error', message: err.message })
+  })
+
+  return () => controller.abort()
+}
+
 export function streamTest(repoFullName, jobId, onEvent) {
   const controller = new AbortController()
   const token      = getToken()
@@ -257,6 +300,100 @@ export function getOutputUrl(jobId, filename) {
 export async function deleteOutputs(jobId) {
   const res = await apiFetch(`${BASE}/outputs/${jobId}`, { method: 'DELETE' })
   return res.json()
+}
+
+export async function chatWithRepo(repoFullName, messages, analysis) {
+  const res = await apiFetch(`${BASE}/chat`, {
+    method: 'POST',
+    body: JSON.stringify({
+      repo_full_name: repoFullName,
+      messages,
+      analysis: analysis || null,
+    }),
+  })
+  return res.json()   // { answer: string }
+}
+
+export async function getRagStatus(repoFullName) {
+  const [owner, name] = repoFullName.split('/')
+  const res = await apiFetch(`${BASE}/rag/status/${owner}/${name}`)
+  return res.json()   // { exists: bool, chunks?: number }
+}
+
+export function streamRagBuild(repoFullName, onEvent) {
+  const controller = new AbortController()
+  const token      = getToken()
+
+  fetch(`${BASE}/rag/build`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ repo_full_name: repoFullName }),
+    signal: controller.signal,
+  }).then(async res => {
+    if (!res.ok) { onEvent({ type: 'error', message: await res.text() }); return }
+    const reader  = res.body.getReader()
+    const decoder = new TextDecoder()
+    let   buffer  = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop()
+      for (const part of parts) {
+        const line = part.trim()
+        if (line.startsWith('data: ')) {
+          try { onEvent(JSON.parse(line.slice(6))) } catch {}
+        }
+      }
+    }
+  }).catch(err => {
+    if (err.name !== 'AbortError')
+      onEvent({ type: 'error', message: err.message })
+  })
+
+  return () => controller.abort()
+}
+
+export function streamArchitect(repoFullName, onEvent) {
+  const controller = new AbortController()
+  const token      = getToken()
+
+  fetch(`${BASE}/architect`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ repo_full_name: repoFullName }),
+    signal: controller.signal,
+  }).then(async res => {
+    if (!res.ok) { onEvent({ type: 'error', message: await res.text() }); return }
+    const reader  = res.body.getReader()
+    const decoder = new TextDecoder()
+    let   buffer  = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop()
+      for (const part of parts) {
+        const line = part.trim()
+        if (line.startsWith('data: ')) {
+          try { onEvent(JSON.parse(line.slice(6))) } catch {}
+        }
+      }
+    }
+  }).catch(err => {
+    if (err.name !== 'AbortError')
+      onEvent({ type: 'error', message: err.message })
+  })
+
+  return () => controller.abort()
 }
 
 

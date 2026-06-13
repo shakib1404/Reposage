@@ -2,9 +2,11 @@ import { useState, useCallback, useEffect, useRef } from 'react'
 import SearchPage        from './pages/SearchPage'
 import SelectPage        from './pages/SelectPage'
 import AnalyzePage       from './pages/AnalyzePage'
+import ArchitectPage     from './pages/ArchitectPage'
 import ExecutePage       from './pages/ExecutePage'
 import OutputPage        from './pages/OutputPage'
 import TestPage          from './pages/TestPage'
+import TaskExecPage      from './pages/TaskExecPage'
 import AuthPage          from './pages/AuthPage'
 import HistoryPage       from './pages/HistoryPage'
 import {
@@ -12,19 +14,21 @@ import {
   createHistory, updateHistory,
 } from './api'
 
-const STEPS = ['search', 'select', 'analyze', 'execute', 'output', 'test', 'history']
+const STEPS = ['search', 'select', 'analyze', 'architect', 'execute', 'output', 'test', 'taskexec', 'history']
 const STEP_LABELS = {
-  search:  '1. Find repos',
-  select:  '2. Select repo',
-  analyze: '3. Analyze',
-  execute: '4. Execute',
-  output:  '5. Output',
-  test:    '6. Audit',
-  history: '📚 History',
+  search:    '1. Find repos',
+  select:    '2. Select repo',
+  analyze:   '3. Analyze',
+  architect: '4. Architecture',
+  execute:   '5. Execute',
+  output:    '6. Output',
+  test:      '7. Audit',
+  taskexec:  '8. RepoTask Exec',
+  history:   '📚 History',
 }
 
 // Steps that are always accessible regardless of workflow progress
-const ALWAYS_ACCESSIBLE = new Set(['history'])
+const ALWAYS_ACCESSIBLE = new Set(['history', 'taskexec'])
 
 export default function App() {
   // ── Auth state ────────────────────────────────────────────────────────────
@@ -37,8 +41,10 @@ export default function App() {
   const [task,         setTask]         = useState('')
   const [repos,        setRepos]        = useState([])
   const [selectedRepo, setSelectedRepo] = useState(null)
-  const [analysis,     setAnalysis]     = useState(null)
-  const [execResult,   setExecResult]   = useState(null)
+  const [analysis,        setAnalysis]        = useState(null)
+  const [architectResult, setArchitectResult] = useState(null)
+  const [chatHistory,     setChatHistory]     = useState([])   // [{role,content}] — persists across tab switches
+  const [execResult,      setExecResult]      = useState(null)
   const [testResult,   setTestResult]   = useState(null)
   const [jobId,        setJobId]        = useState('')
   const [inputFiles,   setInputFiles]   = useState([])
@@ -75,6 +81,8 @@ export default function App() {
     setRepos([])
     setSelectedRepo(null)
     setAnalysis(null)
+    setArchitectResult(null)
+    setChatHistory([])
     setExecResult(null)
     setTestResult(null)
     setJobId('')
@@ -131,6 +139,7 @@ export default function App() {
   const handleRepoSelected = useCallback(async (repo) => {
     setSelectedRepo(repo)
     unlock('analyze')
+    unlock('architect')
     unlock('test')
     const hid = historyIdRef.current
     if (!hid) return
@@ -190,7 +199,7 @@ export default function App() {
     // Unlock all steps that have data
     const steps = ['search']
     if ((state.repos || []).length)  steps.push('select')
-    if (state.selectedRepo)        { steps.push('analyze'); steps.push('test') }
+    if (state.selectedRepo)        { steps.push('analyze'); steps.push('architect'); steps.push('test') }
     if (state.analysis)              steps.push('execute')
     if (state.execResult)          { steps.push('output') }
     if (state.testResult && !steps.includes('test')) steps.push('test')
@@ -212,13 +221,15 @@ export default function App() {
 
   const pageProps = {
     task, setTask,
-    repos,        setRepos: handleReposSet,
-    selectedRepo, setSelectedRepo: handleRepoSelected,
-    analysis,     setAnalysis: handleAnalysisSet,
-    execResult,   setExecResult: handleExecResultSet,
-    testResult,   setTestResult: handleTestResultSet,
-    jobId,        setJobId,
-    inputFiles,   setInputFiles,
+    repos,           setRepos: handleReposSet,
+    selectedRepo,    setSelectedRepo: handleRepoSelected,
+    analysis,        setAnalysis: handleAnalysisSet,
+    architectResult, setArchitectResult,
+    chatHistory,     setChatHistory,
+    execResult,      setExecResult: handleExecResultSet,
+    testResult,      setTestResult: handleTestResultSet,
+    jobId,           setJobId,
+    inputFiles,      setInputFiles,
     unlock, go,
   }
 
@@ -328,12 +339,14 @@ export default function App() {
         {step === 'history' && <HistoryPage onRestore={handleRestore} onNew={handleNewTask} go={s => { go(s); setStep(s) }} />}
         {step !== 'history' && (
           <>
-            {step === 'search'   && <SearchPage   {...pageProps} />}
-            {step === 'select'   && <SelectPage   {...pageProps} />}
-            {step === 'analyze'  && <AnalyzePage  {...pageProps} />}
-            {step === 'execute'  && <ExecutePage  {...pageProps} />}
-            {step === 'output'   && <OutputPage   {...pageProps} />}
-            {step === 'test'     && <TestPage     {...pageProps} />}
+            {step === 'search'    && <SearchPage    {...pageProps} />}
+            {step === 'select'    && <SelectPage    {...pageProps} />}
+            {step === 'analyze'   && <AnalyzePage   {...pageProps} />}
+            {step === 'architect' && <ArchitectPage {...pageProps} />}
+            {step === 'execute'   && <ExecutePage   {...pageProps} />}
+            {step === 'output'    && <OutputPage    {...pageProps} />}
+            {step === 'test'      && <TestPage      {...pageProps} />}
+            {step === 'taskexec'  && <TaskExecPage  {...pageProps} />}
           </>
         )}
       </main>

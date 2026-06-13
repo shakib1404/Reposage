@@ -4,9 +4,12 @@ import json
 import mimetypes
 import os
 import shutil
+import sys
 import uuid
 from pathlib import Path
 from typing import AsyncGenerator, Optional
+
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks
@@ -14,10 +17,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr
 
-load_dotenv()
+# Load project-root .env first (has MONGO_URL, JWT_SECRET, GROQ keys …)
+# then backend/.env for any backend-specific overrides.
+_HERE = Path(__file__).parent
+load_dotenv(_HERE.parent / ".env")
+load_dotenv(_HERE / ".env", override=True)
 
 from search import search_repos, fetch_readme
 from analyzer import analyze_repo
+from architect import generate_architecture
+from chat import answer_question
+from rag import build_index, index_info
 from executor import run_execution_loop, OUTPUT_ROOT, CREDENTIAL_STORE, CREDENTIAL_EVENTS
 from tester import run_test_loop
 from auth import (
@@ -36,13 +46,27 @@ app = FastAPI(title="RepoSage API")
 
 @app.on_event("startup")
 async def warm_db():
-    """Ping MongoDB on startup so the first user request is fast."""
-    try:
-        from auth import get_db
-        db = get_db()
-        await asyncio.wait_for(db.command("ping"), timeout=10)
-    except Exception:
-        pass  # non-fatal — app still starts
+    """Ping MongoDB and pre-load bcrypt on startup so first login is instant."""
+    import asyncio as _asyncio
+
+    # 1. Warm bcrypt — pre-jit the C extension in the thread pool
+    async def _warm_bcrypt():
+        try:
+            from auth import hash_password
+            await hash_password("warmup")
+        except Exception:
+            pass
+
+    # 2. Warm MongoDB connection
+    async def _warm_mongo():
+        try:
+            from auth import get_db
+            db = get_db()
+            await _asyncio.wait_for(db.command("ping"), timeout=8)
+        except Exception:
+            pass
+
+    await _asyncio.gather(_warm_bcrypt(), _warm_mongo())
 
 
 app.add_middleware(
@@ -211,6 +235,27 @@ class TestRequest(BaseModel):
     repo_full_name: str
     job_id:         str = ""
 
+class TaskExecRequest(BaseModel):
+    task:           str
+    repo_full_name: str
+    job_id:         str = ""
+    input_file:     str = ""  # filename only; resolved to full path on server
+
+class ArchitectRequest(BaseModel):
+    repo_full_name: str
+
+class RagBuildRequest(BaseModel):
+    repo_full_name: str
+
+class ChatMessage(BaseModel):
+    role:    str   # "user" | "assistant"
+    content: str
+
+class ChatRequest(BaseModel):
+    repo_full_name: str
+    messages:       list[ChatMessage]
+    analysis:       Optional[dict] = None
+
 class CredentialSubmit(BaseModel):
     credentials: dict[str, str]
 
@@ -263,6 +308,57 @@ async def analyze(req: SelectRequest,
         raise
     except BaseException as e:          # catches SystemExit from repo setup.py
         raise HTTPException(500, str(e) or type(e).__name__)
+
+
+# ── Codebase chatbot ─────────────────────────────────────────────────────────
+@app.post("/api/chat")
+async def chat(req: ChatRequest,
+               user: Optional[dict] = Depends(get_optional_user)):
+    try:
+        msgs = [{"role": m.role, "content": m.content} for m in req.messages]
+        answer = await answer_question(req.repo_full_name, msgs, req.analysis)
+        return {"answer": answer}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── RAG: build index (SSE) ───────────────────────────────────────────────────
+@app.post("/api/rag/build")
+async def rag_build(req: RagBuildRequest,
+                    user: Optional[dict] = Depends(get_optional_user)):
+    async def event_stream() -> AsyncGenerator[str, None]:
+        async for event in build_index(req.repo_full_name):
+            yield f"data: {json.dumps(event)}\n\n"
+            await asyncio.sleep(0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/rag/status/{repo_owner}/{repo_name}")
+async def rag_status(repo_owner: str, repo_name: str,
+                     user: Optional[dict] = Depends(get_optional_user)):
+    repo = f"{repo_owner}/{repo_name}"
+    return index_info(repo)
+
+
+# ── Architecture diagram (SSE) ───────────────────────────────────────────────
+@app.post("/api/architect")
+async def architect(req: ArchitectRequest,
+                    user: Optional[dict] = Depends(get_optional_user)):
+    async def event_stream() -> AsyncGenerator[str, None]:
+        async for event in generate_architecture(req.repo_full_name):
+            yield f"data: {json.dumps(event)}\n\n"
+            await asyncio.sleep(0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── Execute (SSE) ────────────────────────────────────────────────────────────
@@ -330,6 +426,69 @@ async def submit_credentials(job_id: str, req: CredentialSubmit):
     if ev:
         ev.set()
     return {"status": "ok", "job_id": job_id}
+
+
+# ── RepoTask Executor (SSE) — uses repo-task executor agent pipeline ──────────
+
+# Path to the repo-task executor package (sibling of backend/)
+_REPO_TASK_DIR = Path(__file__).parent.parent / "repo-task executor"
+_RUN_TASK_SCRIPT = _REPO_TASK_DIR / "run_task.py"
+
+
+@app.post("/api/taskexec")
+async def task_exec(req: TaskExecRequest,
+                    user: Optional[dict] = Depends(get_optional_user)):
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        def _out(line: str) -> str:
+            return f"data: {json.dumps({'type': 'output', 'line': line})}\n\n"
+
+        github_url = f"https://github.com/{req.repo_full_name}"
+        job_id     = req.job_id or uuid.uuid4().hex
+        workspace  = str(_REPO_TASK_DIR / "workspace" / job_id)
+
+        yield _out(f"🚀  RepoTask Executor — {req.repo_full_name}")
+        yield _out(f"📋  Task: {req.task}")
+        yield _out("")
+        await asyncio.sleep(0)
+
+        try:
+            # Inherit current env + keys from repo-task executor .env
+            env = os.environ.copy()
+            rte_env = _REPO_TASK_DIR / ".env"
+            if rte_env.is_file():
+                for raw in rte_env.read_text().splitlines():
+                    raw = raw.strip()
+                    if raw and not raw.startswith("#") and "=" in raw:
+                        k, _, v = raw.partition("=")
+                        env.setdefault(k.strip(), v.strip())
+
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(_RUN_TASK_SCRIPT),
+                github_url, req.task, workspace,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+
+            async for raw_line in proc.stdout:
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    yield _out(line)
+                await asyncio.sleep(0)
+
+            rc = await proc.wait()
+            yield f"data: {json.dumps({'type': 'done', 'returncode': rc})}\n\n"
+
+        except Exception as exc:
+            yield _out(f"✕  Unexpected error: {exc}")
+            yield f"data: {json.dumps({'type': 'done', 'returncode': 1})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── Test / Audit (SSE) ───────────────────────────────────────────────────────

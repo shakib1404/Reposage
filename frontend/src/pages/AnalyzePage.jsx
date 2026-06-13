@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
-import { analyzeRepo } from '../api'
+import { analyzeRepo, chatWithRepo, getRagStatus, streamRagBuild } from '../api'
 import GraphCanvas from '../components/GraphCanvas'
 import ClusterView from '../components/ClusterView'
 import ScoreBar from '../components/ScoreBar'
@@ -244,14 +244,390 @@ function ExpandableCard({ graphKey, children }) {
   )
 }
 
+// ── RAG status badge ──────────────────────────────────────────────────────────
+function RagBadge({ status }) {
+  if (!status) return null
+  if (status === 'building') {
+    return (
+      <span style={{
+        fontSize: 10, padding: '2px 7px', borderRadius: 10,
+        background: '#1c2a1c', border: '1px solid #22c55e44',
+        color: '#22c55e', fontWeight: 600,
+        display: 'flex', alignItems: 'center', gap: 4,
+      }}>
+        <span className="pulse" style={{ width: 6, height: 6, borderRadius: '50%', background: '#22c55e', display: 'inline-block' }} />
+        Building…
+      </span>
+    )
+  }
+  if (status.startsWith('ready')) {
+    return (
+      <span style={{
+        fontSize: 10, padding: '2px 7px', borderRadius: 10,
+        background: '#1c2a1c', border: '1px solid #22c55e66',
+        color: '#22c55e', fontWeight: 600,
+      }}>
+        RAG {status}
+      </span>
+    )
+  }
+  return (
+    <span style={{
+      fontSize: 10, padding: '2px 7px', borderRadius: 10,
+      background: 'var(--bg3)', border: '1px solid var(--border)',
+      color: 'var(--txt3)',
+    }}>
+      No index
+    </span>
+  )
+}
+
+// ── Chat panel ────────────────────────────────────────────────────────────────
+function ChatPanel({ repo, analysis, history, setHistory, onClose }) {
+  const [input,      setInput]      = useState('')
+  const [loading,    setLoading]    = useState(false)
+  const [error,      setError]      = useState('')
+  const [ragStatus,  setRagStatus]  = useState(null)   // null | 'checking' | 'none' | 'ready N chunks' | 'building'
+  const [buildLog,   setBuildLog]   = useState([])     // progress messages while building
+  const [buildPct,   setBuildPct]   = useState(0)
+  const bottomRef  = useRef(null)
+  const inputRef   = useRef(null)
+  const stopRagRef = useRef(null)
+
+  // Check RAG index on mount
+  useEffect(() => {
+    setRagStatus('checking')
+    getRagStatus(repo?.full_name).then(info => {
+      if (info.exists) setRagStatus(`ready · ${info.chunks} chunks`)
+      else setRagStatus('none')
+    }).catch(() => setRagStatus('none'))
+    return () => { if (stopRagRef.current) stopRagRef.current() }
+  }, [repo?.full_name])
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [history.length, loading, buildLog.length])
+
+  useEffect(() => {
+    inputRef.current?.focus()
+  }, [])
+
+  const startBuild = () => {
+    if (ragStatus === 'building') return
+    setRagStatus('building')
+    setBuildLog(['Starting knowledge base build…'])
+    setBuildPct(0)
+    const stop = streamRagBuild(repo?.full_name, (ev) => {
+      if (ev.type === 'status') {
+        setBuildLog(prev => [...prev, ev.message])
+      } else if (ev.type === 'progress') {
+        const pct = Math.round((ev.done / ev.total) * 100)
+        setBuildPct(pct)
+        setBuildLog(prev => [...prev.slice(-4), ev.message])
+      } else if (ev.type === 'done') {
+        setBuildLog(prev => [...prev, `Done — ${ev.chunks} chunks indexed.`])
+        setBuildPct(100)
+        setRagStatus(`ready · ${ev.chunks} chunks`)
+        stopRagRef.current = null
+      } else if (ev.type === 'error') {
+        setBuildLog(prev => [...prev, `Error: ${ev.message}`])
+        setRagStatus('none')
+        stopRagRef.current = null
+      }
+    })
+    stopRagRef.current = stop
+  }
+
+  const send = async () => {
+    const q = input.trim()
+    if (!q || loading) return
+    setInput('')
+    setError('')
+    const next = [...history, { role: 'user', content: q }]
+    setHistory(next)
+    setLoading(true)
+    try {
+      const { answer } = await chatWithRepo(repo?.full_name, next, analysis)
+      setHistory([...next, { role: 'assistant', content: answer }])
+    } catch (e) {
+      setError(e.message)
+      setHistory(next)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleKey = e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
+  }
+
+  const isReady    = ragStatus?.startsWith('ready')
+  const isBuilding = ragStatus === 'building'
+  const isNone     = ragStatus === 'none'
+
+  const SUGGESTED = [
+    'What does this repo do?',
+    'What is the entry point?',
+    'Which modules are most important?',
+    'How are the modules connected?',
+    'What classes exist and what do they do?',
+  ]
+
+  const body = (
+    <div style={{
+      position: 'fixed', top: 0, right: 0, bottom: 0,
+      width: 440, zIndex: 1100,
+      display: 'flex', flexDirection: 'column',
+      background: 'var(--bg)', borderLeft: '1px solid var(--border)',
+      boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
+      fontFamily: 'var(--font)',
+    }}>
+      {/* Header */}
+      <div style={{
+        padding: '12px 14px', borderBottom: '1px solid var(--border)',
+        display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
+        background: 'var(--bg2)',
+      }}>
+        <div style={{
+          width: 28, height: 28, borderRadius: 8, background: 'var(--accent)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+        }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 600, fontSize: 13 }}>Codebase Chat</div>
+          <div style={{ fontSize: 10, color: 'var(--txt3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {repo?.full_name}
+          </div>
+        </div>
+        <RagBadge status={ragStatus} />
+        {history.length > 0 && (
+          <button
+            onClick={() => setHistory([])}
+            title="Clear history"
+            style={{
+              padding: '3px 8px', fontSize: 10, borderRadius: 4,
+              border: '1px solid var(--border2)',
+              background: 'transparent', color: 'var(--txt3)', cursor: 'pointer',
+            }}
+            onMouseOver={e => e.currentTarget.style.color = 'var(--red)'}
+            onMouseOut={e  => e.currentTarget.style.color = 'var(--txt3)'}
+          >
+            Clear
+          </button>
+        )}
+        <button
+          onClick={onClose}
+          style={{
+            width: 26, height: 26, borderRadius: '50%',
+            border: '1px solid var(--border2)',
+            background: 'var(--bg3)', color: 'var(--txt2)',
+            cursor: 'pointer', fontSize: 14,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >✕</button>
+      </div>
+
+      {/* RAG build panel — shown when no index or building */}
+      {(isNone || isBuilding) && (
+        <div style={{
+          padding: '10px 14px', flexShrink: 0,
+          background: '#0f1a0f', borderBottom: '1px solid #22c55e22',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+            <div style={{ fontSize: 11, color: '#86efac', fontWeight: 500, flex: 1 }}>
+              {isReady ? 'Knowledge base ready' : 'Build a RAG knowledge base for deeper answers'}
+            </div>
+            {!isBuilding && (
+              <button
+                onClick={startBuild}
+                style={{
+                  padding: '4px 12px', fontSize: 11, fontWeight: 600,
+                  background: '#22c55e', border: 'none', borderRadius: 6,
+                  color: 'white', cursor: 'pointer', flexShrink: 0,
+                }}
+              >
+                Build index
+              </button>
+            )}
+          </div>
+          {isBuilding && (
+            <>
+              <div style={{
+                height: 3, background: '#1c2a1c', borderRadius: 2,
+                overflow: 'hidden', marginBottom: 6,
+              }}>
+                <div style={{
+                  height: '100%', width: buildPct + '%',
+                  background: '#22c55e', borderRadius: 2, transition: 'width 0.4s ease',
+                }} />
+              </div>
+              <div style={{ fontSize: 10, color: '#86efac', fontFamily: 'var(--mono)' }}>
+                {buildLog[buildLog.length - 1] || '…'}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Messages */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '14px 14px 8px' }}>
+        {history.length === 0 && (
+          <div style={{ textAlign: 'center', paddingTop: 16 }}>
+            <div style={{ fontSize: 28, marginBottom: 8 }}>💬</div>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Chat with your codebase</div>
+            <div style={{ fontSize: 11, color: 'var(--txt3)', marginBottom: 6 }}>
+              {isReady
+                ? `RAG enabled — answers grounded in actual source code`
+                : 'Build the index above for source-grounded answers'}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--txt3)', marginBottom: 16 }}>
+              Ask anything about {repo?.name || 'this repo'}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {SUGGESTED.map(s => (
+                <button key={s}
+                  onClick={() => setInput(s)}
+                  style={{
+                    textAlign: 'left', padding: '7px 12px', fontSize: 12,
+                    border: '1px solid var(--border)', borderRadius: 8,
+                    background: 'var(--bg2)', color: 'var(--txt2)', cursor: 'pointer',
+                  }}
+                  onMouseOver={e => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--txt)' }}
+                  onMouseOut={e  => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--txt2)' }}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {history.map((msg, i) => (
+          <div key={i} style={{
+            marginBottom: 12,
+            display: 'flex',
+            flexDirection: msg.role === 'user' ? 'row-reverse' : 'row',
+            alignItems: 'flex-start', gap: 8,
+          }}>
+            <div style={{
+              width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
+              background: msg.role === 'user' ? 'var(--accent)' : 'var(--bg3)',
+              border: msg.role === 'assistant' ? '1px solid var(--border2)' : 'none',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12,
+            }}>
+              {msg.role === 'user' ? '👤' : '🤖'}
+            </div>
+            <div style={{
+              maxWidth: '82%', padding: '9px 13px',
+              borderRadius: msg.role === 'user' ? '14px 14px 4px 14px' : '14px 14px 14px 4px',
+              background: msg.role === 'user' ? 'var(--accent)' : 'var(--bg2)',
+              border: msg.role === 'assistant' ? '1px solid var(--border)' : 'none',
+              color: msg.role === 'user' ? 'white' : 'var(--txt)',
+              fontSize: 12, lineHeight: 1.65,
+              whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+            }}>
+              {msg.content}
+            </div>
+          </div>
+        ))}
+
+        {loading && (
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 12 }}>
+            <div style={{
+              width: 26, height: 26, borderRadius: '50%',
+              background: 'var(--bg3)', border: '1px solid var(--border2)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12,
+            }}>🤖</div>
+            <div style={{
+              padding: '9px 14px', borderRadius: '14px 14px 14px 4px',
+              background: 'var(--bg2)', border: '1px solid var(--border)',
+              display: 'flex', gap: 4, alignItems: 'center',
+            }}>
+              {[0, 1, 2].map(n => (
+                <div key={n} className="pulse" style={{
+                  width: 6, height: 6, borderRadius: '50%', background: 'var(--txt3)',
+                  animationDelay: `${n * 0.15}s`,
+                }} />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {error && (
+          <div style={{
+            padding: '8px 12px', borderRadius: 8, marginBottom: 10,
+            background: '#2d1b1b', border: '1px solid var(--red)',
+            color: 'var(--red)', fontSize: 11,
+          }}>
+            Error: {error}
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* Input area */}
+      <div style={{
+        padding: '10px 12px', borderTop: '1px solid var(--border)',
+        background: 'var(--bg2)', flexShrink: 0,
+      }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={handleKey}
+            placeholder={isReady ? 'Ask about source code… (RAG enabled)' : 'Ask about this codebase…'}
+            rows={2}
+            style={{
+              flex: 1, resize: 'none', padding: '8px 10px',
+              background: 'var(--bg3)', border: '1px solid var(--border2)',
+              borderRadius: 8, color: 'var(--txt)', fontFamily: 'var(--font)',
+              fontSize: 12, lineHeight: 1.5, outline: 'none',
+            }}
+            onFocus={e  => e.target.style.borderColor = 'var(--accent)'}
+            onBlur={e   => e.target.style.borderColor = 'var(--border2)'}
+          />
+          <button
+            onClick={send}
+            disabled={!input.trim() || loading}
+            style={{
+              width: 36, height: 36, borderRadius: 8, flexShrink: 0,
+              background: !input.trim() || loading ? 'var(--bg3)' : 'var(--accent)',
+              border: 'none', cursor: !input.trim() || loading ? 'not-allowed' : 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              transition: 'background 0.15s',
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+              stroke={!input.trim() || loading ? 'var(--txt3)' : 'white'}
+              strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"/>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--txt3)', marginTop: 5 }}>
+          Shift+Enter for new line ·{isReady ? ' RAG-grounded answers' : ' build index for RAG'}
+        </div>
+      </div>
+    </div>
+  )
+
+  return createPortal(body, document.body)
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
-export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis, unlock, go }) {
+export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis, chatHistory, setChatHistory, unlock, go }) {
   const [loading,   setLoading]   = useState(!analysis)
   const [status,    setStatus]    = useState('Fetching README…')
   const [progress,  setProgress]  = useState(5)
   const [view,      setView]      = useState('overview')
   const [error,     setError]     = useState('')
   const [expandedGraph, setExpandedGraph] = useState(null) // 'hct'|'fcg'|'mdg'|null
+  const [chatOpen,  setChatOpen]  = useState(false)
 
   useEffect(() => {
     if (analysis) { setLoading(false); setProgress(100); return }
@@ -287,9 +663,14 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
     }
   }
 
-  // Keyboard: Escape closes modal
+  // Keyboard: Escape closes modal or chat panel
   useEffect(() => {
-    const h = e => { if (e.key === 'Escape') setExpandedGraph(null) }
+    const h = e => {
+      if (e.key === 'Escape') {
+        setChatOpen(false)
+        setExpandedGraph(null)
+      }
+    }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
   }, [])
@@ -521,6 +902,50 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
             </div>
           </div>
         </>
+      )}
+
+      {/* ── Floating chat button ─────────────────────────────────────────── */}
+      <button
+        onClick={() => setChatOpen(true)}
+        title="Chat with this codebase"
+        style={{
+          position: 'fixed', bottom: 28, right: 28, zIndex: 1000,
+          width: 52, height: 52, borderRadius: '50%',
+          background: 'var(--accent)', border: 'none',
+          boxShadow: '0 4px 16px rgba(93,142,255,0.45)',
+          cursor: 'pointer',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          transition: 'transform 0.15s, box-shadow 0.15s',
+        }}
+        onMouseOver={e => { e.currentTarget.style.transform = 'scale(1.08)'; e.currentTarget.style.boxShadow = '0 6px 22px rgba(93,142,255,0.6)' }}
+        onMouseOut={e  => { e.currentTarget.style.transform = 'scale(1)';    e.currentTarget.style.boxShadow = '0 4px 16px rgba(93,142,255,0.45)' }}
+      >
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        {chatHistory.length > 0 && (
+          <span style={{
+            position: 'absolute', top: -4, right: -4,
+            minWidth: 18, height: 18, borderRadius: 9,
+            background: '#22c55e', color: 'white',
+            fontSize: 10, fontWeight: 700,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: '0 4px',
+          }}>
+            {chatHistory.filter(m => m.role === 'assistant').length}
+          </span>
+        )}
+      </button>
+
+      {/* ── Chat panel (portal) ──────────────────────────────────────────── */}
+      {chatOpen && (
+        <ChatPanel
+          repo={selectedRepo}
+          analysis={analysis}
+          history={chatHistory}
+          setHistory={setChatHistory}
+          onClose={() => setChatOpen(false)}
+        />
       )}
     </div>
   )

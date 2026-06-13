@@ -55,3 +55,4 @@ yarn-error.log*
 
 # Claude / tool internals
 .claude/
+repo-task executor/workspace/
