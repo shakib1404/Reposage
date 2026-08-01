@@ -1,0 +1,328 @@
+import types
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import ExitStack
+from dataclasses import dataclass
+from functools import wraps
+from heapq import heappop, heappush
+from logging import getLogger
+from typing import TypeVar
+
+from pygments import lexer, lexers
+from pygments.util import ClassNotFound
+
+from .comparison import Comparator, Comparison, Slice
+from .copydetect import CopyDetectComparator
+from .repo import File, Repository, Rounding
+
+log = getLogger(__name__)
+F = TypeVar("F")
+
+
+def get_lexer_for_filename(filename: str) -> lexer.Lexer | None:
+    try:
+        return lexers.get_lexer_for_filename(filename)
+    except ClassNotFound:
+        return None
+
+
+class Status:
+    def on_compare(
+        self,
+        test_files: Iterable[File],  # noqa: ARG002
+        source_files: Iterable[File],  # noqa: ARG002
+    ) -> None | tuple[Iterable[File], Iterable[File]]:
+        return None
+
+    def compare_completed(self, test_files: Iterable[File], source_files: Iterable[File]) -> None:
+        pass
+
+    def update_num_comparisons(self, num: int) -> None:
+        pass
+
+    def update_compare_progress(self, file: File | None = None) -> None:
+        pass
+
+
+@dataclass(frozen=True, unsafe_hash=True)
+class Source:  # noqa: PLW1641 to fix a false-positive from ruff
+    file: File
+    source_slices: tuple[Slice, ...]
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Source):
+            return False
+        return self.file == other.file and self.source_slices == other.source_slices
+
+    def __lt__(self, other: "Source") -> bool:
+        return self.file.relative_path < other.file.relative_path or (
+            self.file == other.file and self.source_slices < other.source_slices
+        )
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.file!r}, {self.source_slices!r})"
+
+    def byte_offset_slice_to_lines_slice(self, to_convert: Slice) -> Slice:
+        from_line = self.file.get_line(to_convert.from_index, rounding=Rounding.DOWN)
+        to_line = self.file.get_line(to_convert.to_index, rounding=Rounding.UP, min_line=from_line + 1)
+        return Slice(from_line, to_line)
+
+    def to_str(self, max_slices: int = -1) -> str:
+        file_str = str(self.file)
+        if max_slices == 0:
+            if self.source_slices:
+                return f"{file_str}:…"
+            return file_str
+        slices = self.source_slices if max_slices < 0 else self.source_slices[:max_slices]
+        slices = [self.byte_offset_slice_to_lines_slice(s) for s in slices]
+        if file_str.startswith("http"):
+            slices_str = ";".join(f"L{s.from_index + 1}-L{s.to_index + 1}" for s in slices)
+            slices_str = f"#{slices_str}"
+        else:
+            slices_str = ";".join(f"{s.from_index + 1}-{s.to_index + 1}" for s in slices)
+            slices_str = f":{slices_str}"
+        if len(slices) < len(self.source_slices):
+            slices_str = f"{slices_str};…"
+        return f"{file_str}{slices_str}"
+
+    def __str__(self) -> str:
+        return self.to_str(max_slices=3)
+
+
+@dataclass(frozen=True, unsafe_hash=True)
+class Detection:
+    test: File
+    source: File
+    comparison: Comparison
+
+    def __lt__(self, other: "Detection") -> bool:
+        return self.comparison < other.comparison
+
+    @property
+    def test_source(self) -> Source:
+        return Source(self.test, self.comparison.slices1)
+
+    @property
+    def test_repo(self) -> Repository:
+        return self.test.repo
+
+    @property
+    def source_repo(self) -> Repository:
+        return self.source.repo
+
+
+class VenDetector:
+    def __init__(
+        self,
+        comparator: Comparator[F] | None = None,
+        status: Status | None = None,
+        batch_size: int = 100,
+        max_history_depth: int | None = None,
+        *,
+        incremental: bool = False,
+    ):
+        if comparator is None:
+            comparator = CopyDetectComparator()
+        self.comparator: Comparator[F] = comparator
+        if status is None:
+            self.status: Status = Status()
+        else:
+            self.status = status
+        self.incremental = incremental
+        self.batch_size = batch_size
+        self.max_history_depth = (
+            max_history_depth if max_history_depth is not None and max_history_depth >= 0 else None
+        )
+        self._fingerprint_cache: dict[File, F] = {}
+
+    @staticmethod
+    def callback(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(self: "VenDetector", *args: tuple, **kwargs: dict) -> Iterator | object:
+            if not hasattr(self.status, f"on_{func.__name__}"):
+                msg = (
+                    f"{self.status.__class__.__name__}.on_{func.__name__} is not defined; required "
+                    f"for @callback on {self.__class__.__name__}.{func.__name__}"
+                )
+                raise TypeError(msg)
+            callback_func = getattr(self.status, f"on_{func.__name__}")
+            modified_args = callback_func(*args, **kwargs)
+            if modified_args is None:
+                modified_args = args
+            ret = func(self, *modified_args, **kwargs)
+            is_generator = isinstance(ret, types.GeneratorType)
+            if is_generator:
+                yield from ret
+            if hasattr(self.status, f"{func.__name__}_completed"):
+                getattr(self.status, f"{func.__name__}_completed")(*modified_args, **kwargs)
+            if not is_generator:
+                return ret  # type: ignore
+
+        return wrapper
+
+    def _get_fingerprint(self, file: File) -> tuple[object, bool]:
+        """Get fingerprint from cache or compute it, returning tuple of (fingerprint, is_cached)."""
+        if file in self._fingerprint_cache:
+            return self._fingerprint_cache[file], True
+
+        try:
+            fp = self.comparator.fingerprint(file.path)
+            self._fingerprint_cache[file] = fp
+            return fp, False  # noqa: TRY300
+        except Exception as e:  # noqa: BLE001
+            log.warning("Error fingerprinting %s: %s", str(file), str(e))
+            return None, False
+
+    @callback
+    def compare(  # noqa: C901, PLR0912, PLR0915
+        self, test_files: Iterable[File], source_files: Iterable[File]
+    ) -> Iterator[Detection]:
+        test_files: list[File] = list(test_files)
+        source_files: list[File] = list(source_files)
+
+        with ExitStack() as stack:
+            for repo in {f.repo for f in test_files} | {f.repo for f in source_files}:
+                stack.enter_context(repo)
+
+            tf: list[File] = []
+            sf: list[File] = []
+
+            skipped_filetypes: set[str] | list[str] = set()
+
+            for lst, files in ((tf, test_files), (sf, source_files)):
+                for file in files:
+                    if get_lexer_for_filename(file.path.name) is None:
+                        log.debug(
+                            "Ignoring %s because we do not have a lexer for its filetype",
+                            str(file),
+                        )
+                        skipped_filetypes.add(file.path.suffix)  # type: ignore
+                    else:
+                        lst.append(file)
+
+            if skipped_filetypes:
+                if "" in skipped_filetypes:
+                    skipped_filetypes.remove("")
+                    skipped_filetypes.add("[No Suffix]")  # type: ignore
+                skipped_filetypes = sorted(skipped_filetypes)
+                if len(skipped_filetypes) == 1:
+                    suffix = f"suffix {skipped_filetypes[0]}"
+                elif len(skipped_filetypes) == 2:  # noqa: PLR2004
+                    suffix = f"suffixes {skipped_filetypes[0]} and {skipped_filetypes[1]}"
+                else:
+                    suffix = f"suffixes {', '.join(skipped_filetypes[:-1])}, and {skipped_filetypes[-1]}"
+                log.warning(
+                    "Ignored files with %s because we do not have a lexer for their filetypes; "
+                    "see the debug log for a list of skipped file paths",
+                    suffix,
+                )
+
+            test_files = tf
+            source_files = sf
+
+            self.status.update_num_comparisons(len(test_files) * len(source_files))
+
+            explored_sources: set[Source] = set()
+            detections: list[Detection] = []
+
+            for i in range(0, len(test_files), self.batch_size):
+                batch_test_files = test_files[i : i + self.batch_size]
+
+                for test_file in batch_test_files:
+                    self.status.update_compare_progress(test_file)
+
+                    fp1, _ = self._get_fingerprint(test_file)
+                    if fp1 is None:
+                        continue
+
+                    for source_file in source_files:
+                        self.status.update_compare_progress()
+
+                        fp2, _ = self._get_fingerprint(source_file)
+                        if fp2 is None:
+                            continue
+
+                        cmp = self.comparator.compare(fp1, fp2)  # type: ignore
+                        d = Detection(test_file, source_file, cmp)
+                        heappush(detections, d)
+
+                if self.incremental and detections:
+                    processed_batch = []
+                    while detections:
+                        d = heappop(detections)
+                        if d.test_source in explored_sources:
+                            continue
+                        processed_batch.append(d)
+                        explored_sources.add(d.test_source)
+                    for d in processed_batch:
+                        yield d
+
+            if not self.incremental:
+                while detections:
+                    d = heappop(detections)
+                    if d.test_source in explored_sources:
+                        continue
+                    yield d
+                    explored_sources.add(d.test_source)
+
+    def find_probable_copy(self, detection: Detection, max_depth: int | None = None) -> Detection:
+        """Find the most probable point in the test repo and source repo when the given detection was vendored."""
+        max_depth = max_depth if max_depth is not None and max_depth >= 0 else self.max_history_depth
+        log.info(
+            "Finding the most probable commit in which %s was copied… (max depth: %s)",
+            str(detection.test_source),
+            str(max_depth) if max_depth is not None else "∞",
+        )
+
+        best: Detection = detection
+        to_test: list[tuple[Repository, Repository, int]] = [(detection.test_repo, detection.source_repo, 0)]
+        history: set[tuple[Repository | None, Repository | None]] = set()
+
+        while to_test:
+            test_repo, source_repo, depth = to_test.pop()
+
+            if max_depth is not None and 0 <= max_depth <= depth:
+                continue
+
+            if history:
+                new_detections = tuple(self.compare((detection.test,), (detection.source,)))
+                if new_detections:
+                    best = min(best, *new_detections)
+
+            pv = test_repo.previous_version(detection.test.relative_path)
+            spv = source_repo.previous_version(detection.source.relative_path)
+
+            if (pv, spv) in history:
+                continue
+
+            history.add((pv, spv))
+            if pv is not None and spv is not None:
+                to_test.append((pv, spv, depth + 1))
+            if pv is not None:
+                to_test.append((pv, source_repo, depth + 1))
+            if spv is not None:
+                to_test.append((test_repo, spv, depth + 1))
+
+        return best
+
+    def detect(
+        self,
+        test_repo: Repository,
+        source_repo: Repository,
+        file_filter: Callable[[File], bool] = lambda _: True,
+        max_history_depth: int | None = None,
+    ) -> Iterator[Detection]:
+        """Detect vendored code between repositories."""
+        test_files = [f for f in test_repo.files() if file_filter(f)]
+        source_files = [f for f in source_repo.files() if file_filter(f)]
+
+        log.info("Analyzing %d test files against %d source files", len(test_files), len(source_files))
+
+        for d in self.compare(test_files, source_files):
+            log.info(
+                "Found a %d token overlap between %s and %s",
+                d.comparison.token_overlap,
+                d.test.relative_path,
+                d.source.relative_path,
+            )
+            probable = self.find_probable_copy(d, max_depth=max_history_depth)
+            yield probable

@@ -30,6 +30,14 @@ from chat import answer_question
 from rag import build_index, index_info
 from executor import run_execution_loop, OUTPUT_ROOT, CREDENTIAL_STORE, CREDENTIAL_EVENTS
 from tester import run_test_loop
+from copydetector.detector import VenDetector, Detection, Source, Status
+from copydetector.repo import Repository, File as RepoFile
+from copydetector.errors import VendetectError, VendetectRuntimeError
+from dupdetect import find_semantic_duplicates, DEFAULT_THRESHOLD as DUP_DEFAULT_THRESHOLD
+from corpus import (
+    add_to_corpus, search_corpus, corpus_status,
+    DEFAULT_MATCH_THRESHOLD as CORPUS_DEFAULT_THRESHOLD,
+)
 from auth import (
     create_user, authenticate_user,
     generate_reset_token, reset_password,
@@ -259,6 +267,15 @@ class ChatRequest(BaseModel):
 class CredentialSubmit(BaseModel):
     credentials: dict[str, str]
 
+class CopyDetectRequest(BaseModel):
+    mode:           str = "cross_repo"   # "cross_repo" | "self_scan"
+    test_repo:      str
+    source_repo:    str = ""             # unused in self_scan mode
+    min_similarity: float = 0.5          # cross_repo: token-overlap threshold
+    dup_threshold:  float = DUP_DEFAULT_THRESHOLD   # self_scan: embedding cosine-similarity threshold
+    dup_scope:      str = "scoped"       # self_scan: "scoped" (same class/module) | "repo_wide" (everything)
+    file_types:     list[str] = []
+
 # ── File upload ──────────────────────────────────────────────────────────────
 @app.post("/api/upload")
 async def upload_files(
@@ -483,6 +500,227 @@ async def task_exec(req: TaskExecRequest,
         except Exception as exc:
             yield _out(f"✕  Unexpected error: {exc}")
             yield f"data: {json.dumps({'type': 'done', 'returncode': 1})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Copy Detector (SSE) — powered by vendetect ───────────────────────────────
+
+_CD_SENTINEL = object()
+
+
+class _SSEStatus(Status):
+    """Forward VenDetector progress callbacks to an asyncio queue."""
+
+    def __init__(self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+        self._q = queue
+        self._loop = loop
+        self._total = 0
+        self._done = 0
+
+    def _send(self, ev: dict) -> None:
+        self._loop.call_soon_threadsafe(self._q.put_nowait, ev)
+
+    def update_num_comparisons(self, num: int) -> None:
+        self._total = num
+        self._send({"type": "status", "message": f"Comparing {num} file pair(s)…"})
+
+    def update_compare_progress(self, file: RepoFile | None = None) -> None:
+        self._done += 1
+        ev: dict = {"type": "progress", "current": self._done, "total": self._total}
+        if file is not None:
+            ev["file"] = str(file.relative_path)
+        self._send(ev)
+
+
+def _detection_to_dict(det: Detection, min_similarity: float) -> dict | None:
+    """Convert a vendetect Detection to a JSON-serialisable dict with code snippets."""
+    avg = (det.comparison.similarity1 + det.comparison.similarity2) / 2
+    if avg < min_similarity:
+        return None
+
+    test_src = det.test_source  # Source(det.test, det.comparison.slices1)
+    slices = []
+
+    for s1, s2 in zip(det.comparison.slices1, det.comparison.slices2):
+        # Convert byte offsets → 0-indexed line numbers (vendetect convention)
+        try:
+            ls1 = test_src.byte_offset_slice_to_lines_slice(s1)
+            t_from = int(ls1.from_index) + 1   # display as 1-indexed
+            t_to   = int(ls1.to_index) + 1
+        except Exception:
+            t_from = t_to = 0
+
+        try:
+            src_obj = Source(det.source, (s2,))
+            ls2 = src_obj.byte_offset_slice_to_lines_slice(s2)
+            s_from = int(ls2.from_index) + 1
+            s_to   = int(ls2.to_index) + 1
+        except Exception:
+            s_from = s_to = 0
+
+        test_code = src_code = ""
+        try:
+            with det.test.repo:
+                lines = det.test.path.read_text(errors="replace").splitlines()
+                test_code = "\n".join(lines[max(0, t_from - 1):t_to])[:3000]
+        except Exception:
+            pass
+        try:
+            with det.source.repo:
+                lines = det.source.path.read_text(errors="replace").splitlines()
+                src_code = "\n".join(lines[max(0, s_from - 1):s_to])[:3000]
+        except Exception:
+            pass
+
+        slices.append({
+            "test_lines":   [int(t_from), int(t_to)],
+            "source_lines": [int(s_from), int(s_to)],
+            "test_code":    test_code,
+            "source_code":  src_code,
+        })
+
+    return {
+        "type":              "detection",
+        "test_file":         str(det.test.relative_path),
+        "source_file":       str(det.source.relative_path),
+        "similarity":        float(round(avg, 4)),
+        "similarity_test":   float(round(det.comparison.similarity1, 4)),
+        "similarity_source": float(round(det.comparison.similarity2, 4)),
+        "token_overlap":     int(det.comparison.token_overlap),
+        "slices":            slices,
+    }
+
+
+@app.post("/api/copydetect")
+async def copy_detect(req: CopyDetectRequest,
+                      user: Optional[dict] = Depends(get_optional_user)):
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        # Self-scan: one repo, find semantically duplicated functions within
+        # the same class/module — natively async, no thread/queue needed.
+        if req.mode == "self_scan":
+            async for ev in find_semantic_duplicates(req.test_repo, threshold=req.dup_threshold, scope=req.dup_scope):
+                yield f"data: {json.dumps(ev)}\n\n"
+                await asyncio.sleep(0)
+            return
+
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+        min_sim = req.min_similarity
+        file_types = req.file_types or []
+
+        def _run() -> None:
+            try:
+                with (
+                    Repository.load(req.test_repo) as test_repo,
+                    Repository.load(req.source_repo) as source_repo,
+                ):
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        {"type": "status", "message": "Repos loaded. Starting detection…"},
+                    )
+
+                    if file_types:
+                        suffixes = {"." + t.lstrip(".") for t in file_types}
+                        def file_filter(f: RepoFile) -> bool:
+                            return f.relative_path.suffix in suffixes
+                    else:
+                        def file_filter(f: RepoFile) -> bool:  # type: ignore[misc]
+                            return True
+
+                    status = _SSEStatus(queue, loop)
+                    vend = VenDetector(status=status)
+                    count = 0
+
+                    for det in vend.detect(test_repo, source_repo, file_filter=file_filter):
+                        det_dict = _detection_to_dict(det, min_sim)
+                        if det_dict:
+                            count += 1
+                            loop.call_soon_threadsafe(queue.put_nowait, det_dict)
+
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        {"type": "done", "total_detections": count},
+                    )
+
+            except VendetectRuntimeError as e:
+                loop.call_soon_threadsafe(
+                    queue.put_nowait, {"type": "error", "message": str(e)}
+                )
+            except Exception as e:
+                loop.call_soon_threadsafe(
+                    queue.put_nowait, {"type": "error", "message": str(e)}
+                )
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, _CD_SENTINEL)
+
+        # Announce remote clones immediately before starting the thread
+        if req.test_repo.startswith(("http://", "https://", "git@")):
+            yield f"data: {json.dumps({'type': 'status', 'message': f'Cloning test repo: {req.test_repo}…'})}\n\n"
+        if req.source_repo.startswith(("http://", "https://", "git@")):
+            yield f"data: {json.dumps({'type': 'status', 'message': f'Cloning source repo: {req.source_repo}…'})}\n\n"
+
+        future = loop.run_in_executor(None, _run)
+
+        while True:
+            item = await queue.get()
+            if item is _CD_SENTINEL:
+                break
+            yield f"data: {json.dumps(item)}\n\n"
+            await asyncio.sleep(0)
+
+        await future
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Corpus similarity search (3rd Copy Detector mode) ───────────────────────────
+
+class CorpusAddRequest(BaseModel):
+    repo: str
+
+class CorpusSearchRequest(BaseModel):
+    repo:           str
+    match_threshold: float = CORPUS_DEFAULT_THRESHOLD
+    top_k:          int = 5
+
+
+@app.get("/api/corpus/status")
+async def corpus_status_route(user: Optional[dict] = Depends(get_optional_user)):
+    return corpus_status()
+
+
+@app.post("/api/corpus/add")
+async def corpus_add_route(req: CorpusAddRequest,
+                           user: Optional[dict] = Depends(get_optional_user)):
+    async def event_stream() -> AsyncGenerator[str, None]:
+        async for ev in add_to_corpus(req.repo):
+            yield f"data: {json.dumps(ev)}\n\n"
+            await asyncio.sleep(0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/corpus/search")
+async def corpus_search_route(req: CorpusSearchRequest,
+                              user: Optional[dict] = Depends(get_optional_user)):
+    async def event_stream() -> AsyncGenerator[str, None]:
+        async for ev in search_corpus(req.repo, threshold=req.match_threshold, top_k=req.top_k):
+            yield f"data: {json.dumps(ev)}\n\n"
+            await asyncio.sleep(0)
 
     return StreamingResponse(
         event_stream(),

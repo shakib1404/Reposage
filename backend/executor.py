@@ -1791,6 +1791,221 @@ def _python_path(venv_path: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Python version detection — venv must use the repo's own required Python,
+#  not whatever version happens to run this backend server. Without this, a
+#  repo pinned to an old Python (say 3.8-only syntax/deps) or one requiring a
+#  brand-new version silently gets built against the wrong interpreter and
+#  fails in ways that look like dependency bugs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Candidate interpreter binaries to look for on PATH, newest first so ties
+# in _find_best_python prefer the newer one without extra sorting logic.
+_PYTHON_CANDIDATES = [f"python3.{m}" for m in range(14, 5, -1)]
+
+
+def _detect_python_requirement(workspace: str) -> Optional[str]:
+    """
+    Look for a declared Python version/constraint, most explicit source
+    first. Returns a PEP 440-style specifier string (e.g. ">=3.8,<3.11") or
+    None if the repo doesn't declare one.
+    """
+    def read(fname: str) -> Optional[str]:
+        fp = os.path.join(workspace, fname)
+        if os.path.isfile(fp):
+            try:
+                return Path(fp).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                return None
+        return None
+
+    def minor_pin(version_str: str) -> Optional[str]:
+        """'3.9.18' / '3.9' -> '==3.9.*' (only minor granularity is meaningful
+        here since we only ever have one interpreter per minor version)."""
+        m = re.match(r"(\d+)\.(\d+)", version_str.strip())
+        return f"=={m.group(1)}.{m.group(2)}.*" if m else None
+
+    def poetry_constraint(spec: str) -> Optional[str]:
+        """Convert poetry's ^/~ shorthand to a plain PEP 440 range."""
+        spec = spec.strip()
+        m = re.match(r"\^(\d+)\.(\d+)", spec)
+        if m:
+            major, minor = int(m.group(1)), int(m.group(2))
+            return f">={major}.{minor},<{major + 1}"
+        m = re.match(r"~(\d+)\.(\d+)", spec)
+        if m:
+            major, minor = int(m.group(1)), int(m.group(2))
+            return f">={major}.{minor},<{major}.{minor + 1}"
+        if re.match(r"^[<>=!]", spec):
+            return spec   # already a plain specifier, e.g. ">=3.9,<3.13"
+        return minor_pin(spec)
+
+    # 1. .python-version (pyenv) — most explicit, wins outright
+    pv = read(".python-version")
+    if pv and pv.strip():
+        spec = minor_pin(pv.splitlines()[0])
+        if spec:
+            return spec
+
+    # 2. runtime.txt (Heroku-style: "python-3.9.18")
+    rt = read("runtime.txt")
+    if rt:
+        m = re.search(r"python-(\d+\.\d+(?:\.\d+)?)", rt)
+        if m:
+            spec = minor_pin(m.group(1))
+            if spec:
+                return spec
+
+    # 3. pyproject.toml — PEP 621 `requires-python` or Poetry's `python`
+    pp = read("pyproject.toml")
+    if pp:
+        m = re.search(r'requires-python\s*=\s*["\']([^"\']+)["\']', pp)
+        if m:
+            return m.group(1)
+        m = re.search(r'^\s*python\s*=\s*["\']([^"\']+)["\']', pp, re.MULTILINE)
+        if m and m.group(1).strip() not in ("*",):
+            spec = poetry_constraint(m.group(1))
+            if spec:
+                return spec
+
+    # 4. setup.cfg
+    sc = read("setup.cfg")
+    if sc:
+        m = re.search(r'python_requires\s*=\s*(.+)', sc)
+        if m:
+            return m.group(1).strip()
+
+    # 5. setup.py
+    sp = read("setup.py")
+    if sp:
+        m = re.search(r'python_requires\s*=\s*["\']([^"\']+)["\']', sp)
+        if m:
+            return m.group(1)
+
+    # 6. Dockerfile — last resort, weakest signal
+    df = read("Dockerfile")
+    if df:
+        m = re.search(r'FROM\s+python:(\d+\.\d+)', df, re.IGNORECASE)
+        if m:
+            return minor_pin(m.group(1))
+
+    return None
+
+
+PYENV_INSTALL_TIMEOUT = int(os.environ.get("PYENV_INSTALL_TIMEOUT", "360"))  # seconds
+
+
+def _pyenv_bin() -> Optional[str]:
+    """
+    Locate the pyenv binary. This backend process's own PATH was captured at
+    startup, before pyenv may have been installed/added to ~/.bashrc, so
+    shutil.which() alone can miss it — check the standard install location
+    directly first.
+    """
+    direct = os.path.expanduser("~/.pyenv/bin/pyenv")
+    if os.path.isfile(direct):
+        return direct
+    return shutil.which("pyenv")
+
+
+async def _pyenv_install(requirement, spec) -> tuple[Optional[str], str]:
+    """
+    On-demand install a Python version satisfying `spec` via pyenv, when no
+    already-installed interpreter matches. Returns (python_path or None, msg).
+    """
+    from packaging.version import Version
+
+    pyenv = _pyenv_bin()
+    if not pyenv:
+        return None, "pyenv not available"
+
+    pyenv_root = os.path.dirname(os.path.dirname(pyenv))  # .../pyenv/bin/pyenv -> .../pyenv
+
+    ok, out = await _run_cmd([pyenv, "install", "--list"], os.getcwd(), timeout=30)
+    if not ok:
+        return None, f"pyenv install --list failed: {out[:200]}"
+
+    # Only consider plain "X.Y.Z" releases (skip alpha/rc/dev/anaconda/etc.)
+    installable = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not re.fullmatch(r"\d+\.\d+\.\d+", line):
+            continue
+        try:
+            v = Version(line)
+            if spec.contains(v):
+                installable.append((v, line))
+        except Exception:
+            continue
+
+    if not installable:
+        return None, f"no installable pyenv version satisfies {requirement}"
+
+    installable.sort(key=lambda x: x[0], reverse=True)
+    _, target = installable[0]
+
+    ok, out = await _run_cmd(
+        [pyenv, "install", "--skip-existing", target],
+        os.getcwd(), timeout=PYENV_INSTALL_TIMEOUT,
+    )
+    py_path = os.path.join(pyenv_root, "versions", target, "bin", "python")
+    if ok and os.path.isfile(py_path):
+        return py_path, f"pyenv installed Python {target}"
+    return None, f"pyenv install {target} failed: {out[-300:]}"
+
+
+async def _find_best_python(requirement: Optional[str]) -> tuple[str, str]:
+    """
+    Pick the interpreter to build the venv with.
+    Returns (python_executable, status_message).
+    """
+    current = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if not requirement:
+        return sys.executable, f"No Python version declared — using host default (Python {current})"
+
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+        spec = SpecifierSet(requirement)
+    except Exception as e:
+        return sys.executable, f"Couldn't parse Python requirement {requirement!r} ({e}) — using host default (Python {current})"
+
+    # Every python3.X on PATH, plus the interpreter already running us.
+    found: dict[str, str] = {current: sys.executable}
+    for name in _PYTHON_CANDIDATES:
+        path = shutil.which(name)
+        if path:
+            found.setdefault(name.removeprefix("python"), path)
+
+    candidates = []
+    for ver_str, path in found.items():
+        try:
+            candidates.append((Version(f"{ver_str}.0"), ver_str, path))
+        except Exception:
+            continue
+
+    matching = sorted((c for c in candidates if spec.contains(c[0])), key=lambda c: c[0], reverse=True)
+    if matching:
+        _, ver_str, path = matching[0]
+        return path, f"Repo requires Python {requirement} — using Python {ver_str} ({path})"
+
+    # Nothing installed satisfies the constraint — try compiling the exact
+    # version via pyenv before giving up (bounded by PYENV_INSTALL_TIMEOUT).
+    pyenv_path, pyenv_msg = await _pyenv_install(requirement, spec)
+    if pyenv_path:
+        return pyenv_path, f"Repo requires Python {requirement} — {pyenv_msg} ({pyenv_path})"
+
+    # pyenv unavailable/failed — fall back to the closest already-installed
+    # version rather than failing outright (best-effort > hard stop).
+    closest = sorted(candidates, key=lambda c: c[0], reverse=True)
+    if closest:
+        _, ver_str, path = closest[0]
+        return path, (f"Repo requires Python {requirement} but no matching interpreter is "
+                       f"installed and {pyenv_msg} — falling back to Python {ver_str} (may not work)")
+
+    return sys.executable, f"Repo requires Python {requirement} — no alternative interpreter found, using host default (Python {current})"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Environment Setup
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1802,8 +2017,12 @@ async def _setup_environment(
 ) -> tuple[bool, str]:
     parts: list[str] = []
 
+    requirement = _detect_python_requirement(workspace)
+    python_exe, python_msg = await _find_best_python(requirement)
+    parts.append(f"ℹ {python_msg}")
+
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "venv", venv_path,
+        python_exe, "-m", "venv", venv_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -1812,7 +2031,22 @@ async def _setup_environment(
     except asyncio.TimeoutError:
         return False, "venv creation timed out"
     if proc.returncode != 0:
-        return False, f"venv creation failed: {err.decode()[:300]}"
+        # The selected interpreter may be missing venv/ensurepip (common on
+        # minimal system installs) — retry once with the host default before
+        # giving up, so a version-selection choice can't fully block execution.
+        if python_exe != sys.executable:
+            parts.append(f"⚠ venv creation failed with {python_exe} ({err.decode(errors='ignore')[:200]}), retrying with host default")
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "venv", venv_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+            except asyncio.TimeoutError:
+                return False, "venv creation timed out"
+        if proc.returncode != 0:
+            return False, f"venv creation failed: {err.decode(errors='ignore')[:300]}"
     parts.append("✓ Virtual environment created")
 
     pip = _pip_path(venv_path)

@@ -7,6 +7,7 @@ import ExecutePage       from './pages/ExecutePage'
 import OutputPage        from './pages/OutputPage'
 import TestPage          from './pages/TestPage'
 import TaskExecPage      from './pages/TaskExecPage'
+import CopyDetectPage   from './pages/CopyDetectPage'
 import AuthPage          from './pages/AuthPage'
 import HistoryPage       from './pages/HistoryPage'
 import {
@@ -14,21 +15,22 @@ import {
   createHistory, updateHistory,
 } from './api'
 
-const STEPS = ['search', 'select', 'analyze', 'architect', 'execute', 'output', 'test', 'taskexec', 'history']
+const STEPS = ['search', 'select', 'analyze', 'architect', 'execute', 'output', 'test', 'taskexec', 'copydetect', 'history']
 const STEP_LABELS = {
-  search:    '1. Find repos',
-  select:    '2. Select repo',
-  analyze:   '3. Analyze',
-  architect: '4. Architecture',
-  execute:   '5. Execute',
-  output:    '6. Output',
-  test:      '7. Audit',
-  taskexec:  '8. RepoTask Exec',
-  history:   '📚 History',
+  search:      '1. Find repos',
+  select:      '2. Select repo',
+  analyze:     '3. Analyze',
+  architect:   '4. Architecture',
+  execute:     '5. Execute',
+  output:      '6. Output',
+  test:        '7. Audit',
+  taskexec:    '8. RepoTask Exec',
+  copydetect:  '🔎 Copy Detector',
+  history:     '📚 History',
 }
 
 // Steps that are always accessible regardless of workflow progress
-const ALWAYS_ACCESSIBLE = new Set(['history', 'taskexec'])
+const ALWAYS_ACCESSIBLE = new Set(['history', 'taskexec', 'copydetect'])
 
 export default function App() {
   // ── Auth state ────────────────────────────────────────────────────────────
@@ -336,8 +338,9 @@ export default function App() {
 
       {/* ── Page content ───────────────────────────────────────────────── */}
       <main style={{ flex: 1, overflow: 'auto' }}>
-        {step === 'history' && <HistoryPage onRestore={handleRestore} onNew={handleNewTask} go={s => { go(s); setStep(s) }} />}
-        {step !== 'history' && (
+        {step === 'history'     && <HistoryPage onRestore={handleRestore} onNew={handleNewTask} go={s => { go(s); setStep(s) }} />}
+        {step === 'copydetect'  && <CopyDetectPage />}
+        {step !== 'history' && step !== 'copydetect' && (
           <>
             {step === 'search'    && <SearchPage    {...pageProps} />}
             {step === 'select'    && <SelectPage    {...pageProps} />}

@@ -283,26 +283,12 @@ function RagBadge({ status }) {
 }
 
 // ── Chat panel ────────────────────────────────────────────────────────────────
-function ChatPanel({ repo, analysis, history, setHistory, onClose }) {
+function ChatPanel({ repo, analysis, history, setHistory, onClose, ragStatus, buildLog, buildPct }) {
   const [input,      setInput]      = useState('')
   const [loading,    setLoading]    = useState(false)
   const [error,      setError]      = useState('')
-  const [ragStatus,  setRagStatus]  = useState(null)   // null | 'checking' | 'none' | 'ready N chunks' | 'building'
-  const [buildLog,   setBuildLog]   = useState([])     // progress messages while building
-  const [buildPct,   setBuildPct]   = useState(0)
   const bottomRef  = useRef(null)
   const inputRef   = useRef(null)
-  const stopRagRef = useRef(null)
-
-  // Check RAG index on mount
-  useEffect(() => {
-    setRagStatus('checking')
-    getRagStatus(repo?.full_name).then(info => {
-      if (info.exists) setRagStatus(`ready · ${info.chunks} chunks`)
-      else setRagStatus('none')
-    }).catch(() => setRagStatus('none'))
-    return () => { if (stopRagRef.current) stopRagRef.current() }
-  }, [repo?.full_name])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -311,32 +297,6 @@ function ChatPanel({ repo, analysis, history, setHistory, onClose }) {
   useEffect(() => {
     inputRef.current?.focus()
   }, [])
-
-  const startBuild = () => {
-    if (ragStatus === 'building') return
-    setRagStatus('building')
-    setBuildLog(['Starting knowledge base build…'])
-    setBuildPct(0)
-    const stop = streamRagBuild(repo?.full_name, (ev) => {
-      if (ev.type === 'status') {
-        setBuildLog(prev => [...prev, ev.message])
-      } else if (ev.type === 'progress') {
-        const pct = Math.round((ev.done / ev.total) * 100)
-        setBuildPct(pct)
-        setBuildLog(prev => [...prev.slice(-4), ev.message])
-      } else if (ev.type === 'done') {
-        setBuildLog(prev => [...prev, `Done — ${ev.chunks} chunks indexed.`])
-        setBuildPct(100)
-        setRagStatus(`ready · ${ev.chunks} chunks`)
-        stopRagRef.current = null
-      } else if (ev.type === 'error') {
-        setBuildLog(prev => [...prev, `Error: ${ev.message}`])
-        setRagStatus('none')
-        stopRagRef.current = null
-      }
-    })
-    stopRagRef.current = stop
-  }
 
   const send = async () => {
     const q = input.trim()
@@ -363,7 +323,6 @@ function ChatPanel({ repo, analysis, history, setHistory, onClose }) {
 
   const isReady    = ragStatus?.startsWith('ready')
   const isBuilding = ragStatus === 'building'
-  const isNone     = ragStatus === 'none'
 
   const SUGGESTED = [
     'What does this repo do?',
@@ -430,45 +389,29 @@ function ChatPanel({ repo, analysis, history, setHistory, onClose }) {
         >✕</button>
       </div>
 
-      {/* RAG build panel — shown when no index or building */}
-      {(isNone || isBuilding) && (
+      {/* RAG build panel — shown while auto-building in the background */}
+      {isBuilding && (
         <div style={{
           padding: '10px 14px', flexShrink: 0,
           background: '#0f1a0f', borderBottom: '1px solid #22c55e22',
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
             <div style={{ fontSize: 11, color: '#86efac', fontWeight: 500, flex: 1 }}>
-              {isReady ? 'Knowledge base ready' : 'Build a RAG knowledge base for deeper answers'}
+              Building knowledge base…
             </div>
-            {!isBuilding && (
-              <button
-                onClick={startBuild}
-                style={{
-                  padding: '4px 12px', fontSize: 11, fontWeight: 600,
-                  background: '#22c55e', border: 'none', borderRadius: 6,
-                  color: 'white', cursor: 'pointer', flexShrink: 0,
-                }}
-              >
-                Build index
-              </button>
-            )}
           </div>
-          {isBuilding && (
-            <>
-              <div style={{
-                height: 3, background: '#1c2a1c', borderRadius: 2,
-                overflow: 'hidden', marginBottom: 6,
-              }}>
-                <div style={{
-                  height: '100%', width: buildPct + '%',
-                  background: '#22c55e', borderRadius: 2, transition: 'width 0.4s ease',
-                }} />
-              </div>
-              <div style={{ fontSize: 10, color: '#86efac', fontFamily: 'var(--mono)' }}>
-                {buildLog[buildLog.length - 1] || '…'}
-              </div>
-            </>
-          )}
+          <div style={{
+            height: 3, background: '#1c2a1c', borderRadius: 2,
+            overflow: 'hidden', marginBottom: 6,
+          }}>
+            <div style={{
+              height: '100%', width: buildPct + '%',
+              background: '#22c55e', borderRadius: 2, transition: 'width 0.4s ease',
+            }} />
+          </div>
+          <div style={{ fontSize: 10, color: '#86efac', fontFamily: 'var(--mono)' }}>
+            {buildLog[buildLog.length - 1] || '…'}
+          </div>
         </div>
       )}
 
@@ -610,7 +553,7 @@ function ChatPanel({ repo, analysis, history, setHistory, onClose }) {
           </button>
         </div>
         <div style={{ fontSize: 10, color: 'var(--txt3)', marginTop: 5 }}>
-          Shift+Enter for new line ·{isReady ? ' RAG-grounded answers' : ' build index for RAG'}
+          Shift+Enter for new line ·{isReady ? ' RAG-grounded answers' : ' indexing in background…'}
         </div>
       </div>
     </div>
@@ -628,6 +571,11 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
   const [error,     setError]     = useState('')
   const [expandedGraph, setExpandedGraph] = useState(null) // 'hct'|'fcg'|'mdg'|null
   const [chatOpen,  setChatOpen]  = useState(false)
+  const [ragStatus, setRagStatus] = useState(null)   // null | 'checking' | 'none' | 'ready N chunks' | 'building'
+  const [buildLog,  setBuildLog]  = useState([])
+  const [buildPct,  setBuildPct]  = useState(0)
+  const ragStartedRef = useRef(null)   // repo_full_name that build was already started/checked for
+  const stopRagRef    = useRef(null)
 
   useEffect(() => {
     if (analysis) { setLoading(false); setProgress(100); return }
@@ -638,6 +586,45 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
   useEffect(() => {
     if (analysis) window.__rm_analysis__ = analysis
   }, [analysis])
+
+  // Auto-build the RAG knowledge base as soon as analysis is available — no manual step needed
+  useEffect(() => {
+    const repoName = selectedRepo?.full_name
+    if (!analysis || !repoName) return
+    if (ragStartedRef.current === repoName) return
+    ragStartedRef.current = repoName
+
+    setRagStatus('checking')
+    getRagStatus(repoName).then(info => {
+      if (info.exists) {
+        setRagStatus(`ready · ${info.chunks} chunks`)
+        return
+      }
+      setRagStatus('building')
+      setBuildLog(['Starting knowledge base build…'])
+      setBuildPct(0)
+      stopRagRef.current = streamRagBuild(repoName, (ev) => {
+        if (ev.type === 'status') {
+          setBuildLog(prev => [...prev, ev.message])
+        } else if (ev.type === 'progress') {
+          const pct = Math.round((ev.done / ev.total) * 100)
+          setBuildPct(pct)
+          setBuildLog(prev => [...prev.slice(-4), ev.message])
+        } else if (ev.type === 'done') {
+          setBuildLog(prev => [...prev, `Done — ${ev.chunks} chunks indexed.`])
+          setBuildPct(100)
+          setRagStatus(`ready · ${ev.chunks} chunks`)
+          stopRagRef.current = null
+        } else if (ev.type === 'error') {
+          setBuildLog(prev => [...prev, `Error: ${ev.message}`])
+          setRagStatus('none')
+          stopRagRef.current = null
+        }
+      })
+    }).catch(() => setRagStatus('none'))
+
+    return () => { if (stopRagRef.current) stopRagRef.current() }
+  }, [analysis, selectedRepo?.full_name])
 
   const run = async () => {
     try {
@@ -945,6 +932,9 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
           history={chatHistory}
           setHistory={setChatHistory}
           onClose={() => setChatOpen(false)}
+          ragStatus={ragStatus}
+          buildLog={buildLog}
+          buildPct={buildPct}
         />
       )}
     </div>

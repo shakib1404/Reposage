@@ -297,6 +297,81 @@ export function getOutputUrl(jobId, filename) {
   return `${BASE}/outputs/${jobId}/${encodeURIComponent(filename)}`
 }
 
+// Shared SSE POST helper — fetch + ReadableStream (not EventSource, so auth headers can be sent).
+function _streamSSE(path, body, onEvent) {
+  const controller = new AbortController()
+  const token      = getToken()
+
+  fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: controller.signal,
+  }).then(async res => {
+    if (!res.ok) { onEvent({ type: 'error', message: await res.text() }); return }
+    const reader  = res.body.getReader()
+    const decoder = new TextDecoder()
+    let   buffer  = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop()
+      for (const part of parts) {
+        const line = part.trim()
+        if (line.startsWith('data: ')) {
+          try { onEvent(JSON.parse(line.slice(6))) } catch {}
+        }
+      }
+    }
+  }).catch(err => {
+    if (err.name !== 'AbortError')
+      onEvent({ type: 'error', message: err.message })
+  })
+
+  return () => controller.abort()
+}
+
+export function streamCopyDetect(params, onEvent) {
+  const {
+    mode = 'cross_repo',       // 'cross_repo' | 'self_scan'
+    testRepo, sourceRepo = '',
+    minSimilarity = 0.5,
+    dupThreshold = 0.68,
+    dupScope = 'scoped',        // 'scoped' (same class/module) | 'repo_wide'
+    fileTypes = [],
+  } = params
+
+  return _streamSSE('/copydetect', {
+    mode,
+    test_repo:      testRepo,
+    source_repo:    sourceRepo,
+    min_similarity: minSimilarity,
+    dup_threshold:  dupThreshold,
+    dup_scope:      dupScope,
+    file_types:     fileTypes || [],
+  }, onEvent)
+}
+
+// ── Corpus similarity search (3rd Copy Detector mode) ───────────────────────────
+
+export async function getCorpusStatus() {
+  const res = await apiFetch(`${BASE}/corpus/status`)
+  return res.json()   // { repo_count, function_count, repos: [...] }
+}
+
+export function streamCorpusAdd(repo, onEvent) {
+  return _streamSSE('/corpus/add', { repo }, onEvent)
+}
+
+export function streamCorpusSearch(repo, matchThreshold, topK, onEvent) {
+  return _streamSSE('/corpus/search', { repo, match_threshold: matchThreshold, top_k: topK }, onEvent)
+}
+
 export async function deleteOutputs(jobId) {
   const res = await apiFetch(`${BASE}/outputs/${jobId}`, { method: 'DELETE' })
   return res.json()

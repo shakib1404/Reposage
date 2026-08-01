@@ -1,17 +1,27 @@
 """
 search.py — GitHub repo discovery
-Serper for search  ·  Groq for semantic ranking.
+Serper + GitHub Search API + Jina Search for candidates · Groq for query
+normalization and semantic ranking. No hardcoded topic/domain word lists —
+query understanding and ranking are entirely LLM-driven so any phrasing of
+any task is handled the same way.
 
 Key design decisions:
-  • The RAW task phrase is used as the primary Serper query so directional
-    meaning ("json TO pdf", not "pdf to json") is preserved exactly.
-  • A secondary keyword query runs in parallel to widen the result set.
-  • The LLM ranking prompt explicitly penalises repos that do the REVERSE
-    of what the user asked, and rewards exact semantic match.
+  • _normalize_query() runs FIRST: the LLM collapses the raw task into one
+    canonical technical phrase, so differently-worded requests for the same
+    underlying task retrieve the same candidate pool instead of diverging
+    based on phrasing luck. Direction ("json TO pdf" vs "pdf to json") is
+    explicitly preserved by the normalization prompt.
+  • Four search sources run in parallel on the normalized query: two Serper
+    queries (exact phrase + broad), GitHub's own Search API, and Jina's
+    Search API (semantic, good recall on obscure repos).
+  • The LLM ranking prompt scores both direction and topic/domain match,
+    penalising repos that do the REVERSE of what the user asked or that
+    solve a different underlying problem, even if keywords overlap.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 
@@ -19,8 +29,34 @@ import httpx
 
 from llm import chat as llm_chat
 
+log = logging.getLogger(__name__)
+
 SERPER_KEY = os.getenv("SERPER_API_KEY", "")
+JINA_KEY   = os.getenv("JINA_API_KEY", "")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 USE_MOCK   = os.getenv("USE_MOCK", "false").lower() == "true"
+
+# How many merged candidates get enriched + ranked. GitHub's search alone
+# can return ~19 raw items (4 sub-queries) and is listed first in merge
+# priority, so a cap of 15 was silently dropping every Jina/Serper-only
+# candidate that GitHub didn't also find — including highly-starred, clearly
+# relevant repos. 30 comfortably covers realistic merged totals (~26 in
+# testing) without letting a pathological query balloon API/rerank cost.
+MAX_CANDIDATES = 30
+
+# Authenticated GitHub API requests get 5000 req/hr instead of 60 — without
+# this, a single search (multiple GitHub Search API queries + up to
+# MAX_CANDIDATES star enrichment calls) can silently exhaust the
+# unauthenticated quota and start returning degraded (0-star) or empty
+# results.
+def _github_headers() -> dict:
+    headers = {
+        "Accept":     "application/vnd.github.v3+json",
+        "User-Agent": "RepoSage/1.0",
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    return headers
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,39 +67,106 @@ async def search_repos(task: str) -> list[dict]:
     if USE_MOCK:
         return _mock_repos(task)
 
-    # Run three searches in parallel:
+    # Normalize the raw task into a canonical technical phrase FIRST.
+    # Two differently-worded requests for the same underlying task
+    # ("audio mood classification tool" vs "help me sort my music files by
+    # mood automatically") must retrieve the same candidate pool — otherwise
+    # search results depend on phrasing luck instead of intent. All four
+    # search sources below query on this canonical phrase; the raw `task`
+    # is still used later for LLM ranking so direction/nuance judged against
+    # the user's literal wording.
+    query = await _normalize_query(task)
+
+    # Run four searches in parallel:
     #   1. Serper exact phrase — preserves direction/meaning
     #   2. Serper keyword     — broader candidate pool
     #   3. GitHub Search API  — finds exact repos by name/description
+    #   4. Jina Search        — semantic web search; does its own query
+    #                           understanding on top of the already-canonical
+    #                           phrase, for extra recall on obscure repos.
     results = await asyncio.gather(
-        _serper_search_query(f'"{task}" python github'),
-        _serper_search_query(_keyword_query(task)),
-        _github_search(task),
+        _serper_search_query(f'"{query}" python github'),
+        _serper_search_query(_keyword_query(query)),
+        _github_search(query),
+        _jina_search(query),
         return_exceptions=True,
     )
     raw1 = results[0] if not isinstance(results[0], Exception) else []
     raw2 = results[1] if not isinstance(results[1], Exception) else []
     raw3 = results[2] if not isinstance(results[2], Exception) else []
-    for i, label in enumerate(("serper-exact", "serper-kw", "github")):
+    raw4 = results[3] if not isinstance(results[3], Exception) else []
+    for i, label in enumerate(("serper-exact", "serper-kw", "github", "jina")):
         if isinstance(results[i], Exception):
             log.warning("Search %s failed: %s", label, results[i])
 
-    # Merge, deduplicate, keep insertion order
+    # Merge, deduplicate, keep insertion order.
+    # GitHub API (exact name/description match) first, then Jina's semantic
+    # read of the raw task, then the two Serper queries.
     seen: set[str] = set()
     raw_repos: list[dict] = []
-    for r in raw1 + raw3 + raw2:       # GitHub API results take priority
+    for r in raw3 + raw4 + raw1 + raw2:
         if r["full_name"] not in seen:
             seen.add(r["full_name"])
             raw_repos.append(r)
 
     if not raw_repos:
-        return _mock_repos(task)
+        # All 3 live search APIs came back empty/failed — last resort is to
+        # ask the LLM to recall known repos from training knowledge, still
+        # keyed off the actual task (not a hardcoded topic-bucket guess).
+        return await _llm_recall_repos(task)
 
-    # Fetch real star counts for all candidates
+    # Fetch real star counts + topics for all candidates
     raw_repos = await _enrich_with_stars(raw_repos)
 
-    ranked = await _rank_repos(raw_repos, task)
+    # Rank against the NORMALIZED query, not the raw task — retrieval already
+    # used `query`, so ranking on the same text guarantees two differently
+    # -worded requests for the same intent get identical results end-to-end,
+    # instead of embedding similarity re-introducing phrasing sensitivity.
+    ranked = await _rank_repos(raw_repos, query)
     return ranked[:3]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Query normalization — makes retrieval phrasing-independent
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NORMALIZE_SYSTEM = (
+    "You normalize vague or casually-phrased software requests into the "
+    "standard, canonical technical term for the underlying task — the exact "
+    "phrase a developer would use to name this field/technique, as it would "
+    "appear in a GitHub repo description or paper title. Always lowercase. "
+    "2-6 words. No filler, no adjectives like tool/automatically/app. "
+    "Two different phrasings of the same underlying task MUST map to the "
+    "same canonical term. If the task converts/transforms one format or "
+    "thing INTO another, preserve the exact A-to-B direction — never swap it. "
+    "ALWAYS keep named platforms, products, or technologies mentioned by name "
+    "(Discord, Telegram, Spotify, AWS, React, etc.) — never drop or generalize "
+    "them away, they are not filler.\n\n"
+    "Examples:\n"
+    '"help me sort my music files by mood automatically" -> "audio mood classification"\n'
+    '"audio mood classification tool" -> "audio mood classification"\n'
+    '"turn my old photos into color" -> "image colorization"\n'
+    '"colorize black and white photos" -> "image colorization"\n'
+    '"convert json to pdf" -> "json to pdf conversion"\n'
+    '"i want to turn my json data into a pdf document" -> "json to pdf conversion"\n'
+    '"a discord bot that plays music" -> "discord music bot"\n'
+    '"i need something to post my tweets to slack" -> "twitter to slack integration"\n'
+    "Return ONLY the canonical phrase."
+)
+
+
+async def _normalize_query(task: str) -> str:
+    """Collapse any phrasing of the same intent to one canonical search phrase."""
+    try:
+        result = await llm_chat(
+            system=_NORMALIZE_SYSTEM, user=task,
+            max_tokens=20, temperature=0.0,
+        )
+        cleaned = result.strip().strip('"').strip(".").lower()
+        return cleaned or task
+    except Exception as e:
+        log.warning("Query normalization failed, using raw task: %s", e)
+        return task
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,36 +224,74 @@ async def _serper_search_query(query: str) -> list[dict]:
     return repos
 
 
-async def _github_search(task: str) -> list[dict]:
+async def _jina_search(task: str) -> list[dict]:
+    """
+    Run the RAW task through Jina's Search API (s.jina.ai).
+    Unlike Serper/GitHub, this does its own semantic query understanding —
+    it's the source that keeps working when the user's phrasing is
+    colloquial, vague, or doesn't reduce cleanly to keywords.
+    """
+    headers = {
+        "Accept": "application/json",
+        "X-Respond-With": "no-content",   # we only need title/url/description
+    }
+    if JINA_KEY:
+        headers["Authorization"] = f"Bearer {JINA_KEY}"
+    params = {"q": f"{task} github repository python"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get("https://s.jina.ai/", headers=headers, params=params)
+            data = resp.json()
+    except Exception as e:
+        log.warning("Jina search failed: %s", e)
+        return []
+
+    repos: list[dict] = []
+    seen: set[str] = set()
+    for item in data.get("data") or []:
+        link = item.get("url") or item.get("link") or ""
+        m = re.match(r"https://github\.com/([^/]+)/([^/?\s#]+)", link)
+        if not m:
+            continue
+        owner = m.group(1).strip("/").lower()
+        name  = m.group(2).strip("/")
+        if owner in GITHUB_RESERVED:
+            continue
+        path_after = link[m.end():]
+        if path_after and not path_after.startswith("?") and path_after != "/":
+            continue
+        full_name = f"{m.group(1)}/{name}"
+        if full_name in seen:
+            continue
+        seen.add(full_name)
+        repos.append({
+            "full_name": full_name,
+            "name":      name,
+            "owner":     m.group(1),
+            "snippet":   item.get("description", ""),
+            "title":     item.get("title", ""),
+        })
+    return repos
+
+
+async def _github_search(query: str) -> list[dict]:
     """
     Search GitHub's own repository search API.
-    Finds repos by name / description — much better for specific phrases.
-    No auth needed; rate limit is 10 req/min unauthenticated.
+    `query` is the LLM-normalized canonical phrase — already short and
+    keyword-dense, so no hardcoded verb/stopword stripping is needed here;
+    we just vary how it's matched (phrase, tokens, hyphenated repo name).
     """
-    # Three GitHub queries:
-    # 1. Exact phrase in description/readme
-    # 2. Keywords
-    # 3. NOUNS ONLY in repo name — strips verbs/prepositions so
-    #    "convert json to pdf" → "json pdf" which matches "json-to-pdf"
-    kw = _keyword_query(task).replace(" python", "").replace(" machine-learning", "").strip()
-    SKIP_VERBS = {"convert", "converting", "create", "make", "build", "use",
-                  "using", "generate", "parse", "read", "write", "get", "to",
-                  "from", "into", "a", "an", "the", "and", "or", "for", "with"}
-    nouns = [t for t in re.findall(r"[a-zA-Z0-9]+", task.lower())
-             if t not in SKIP_VERBS and len(t) > 1]
-    hyphen_name = "-".join(nouns)   # e.g. "json-to-pdf", "pdf-to-json"
+    tokens = re.findall(r"[a-zA-Z0-9]+", query.lower())
+    hyphen_name = "-".join(tokens)   # e.g. "json-to-pdf-conversion"
     queries = [
-        f'"{task}" language:python',
-        f'{kw} language:python',
-        f'{" ".join(nouns)} in:name,description language:python',
+        f'"{query}" language:python',
+        f'{query} language:python',
+        f'{" ".join(tokens)} in:name,description language:python',
         f'{hyphen_name} in:name',   # catches exact hyphenated repo names
     ]
     repos: list[dict] = []
     seen:  set[str]   = set()
-    headers = {
-        "Accept":     "application/vnd.github.v3+json",
-        "User-Agent": "RepoSage/1.0",
-    }
+    headers = _github_headers()
     async with httpx.AsyncClient(timeout=10) as client:
         for q in queries:
             try:
@@ -179,6 +320,7 @@ async def _github_search(task: str) -> list[dict]:
                             "title":       item.get("name", ""),
                             "stars_int":   item.get("stargazers_count", 0),
                             "language":    item.get("language") or "Python",
+                            "topics":      item.get("topics") or [],
                         })
             except Exception:
                 continue
@@ -188,12 +330,9 @@ async def _github_search(task: str) -> list[dict]:
 async def _enrich_with_stars(repos: list[dict]) -> list[dict]:
     """
     Fetch real star counts from GitHub API for repos that don't already have one.
-    Runs all requests concurrently (max 10 repos).
+    Runs all requests concurrently (max MAX_CANDIDATES repos).
     """
-    headers = {
-        "Accept":     "application/vnd.github.v3+json",
-        "User-Agent": "RepoSage/1.0",
-    }
+    headers = _github_headers()
     async def fetch_one(repo: dict) -> dict:
         if repo.get("stars_int") is not None:
             return repo          # already have stars from GitHub search
@@ -207,13 +346,14 @@ async def _enrich_with_stars(repos: list[dict]) -> list[dict]:
                     data = resp.json()
                     repo["stars_int"]  = data.get("stargazers_count", 0)
                     repo["language"]   = data.get("language") or repo.get("language", "Python")
+                    repo["topics"]     = data.get("topics") or []
                     if not repo.get("snippet"):
                         repo["snippet"] = data.get("description") or ""
         except Exception:
             pass
         return repo
 
-    enriched = await asyncio.gather(*[fetch_one(r) for r in repos[:10]])
+    enriched = await asyncio.gather(*[fetch_one(r) for r in repos[:MAX_CANDIDATES]])
     return list(enriched)
 
 
@@ -239,99 +379,140 @@ def _star_weight(stars: int) -> float:
     return min(10.0, math.log10(stars + 1) / math.log10(100_001) * 10)
 
 
-def _keyword_query(task: str) -> str:
+def _keyword_query(query: str) -> str:
     """
-    Build a secondary search query from meaningful words only.
-    Preserves conversion direction words (to, from, into, convert).
-    Does NOT append 'deep learning' for non-ML tasks.
+    `query` is already the LLM-normalized canonical phrase (short,
+    keyword-dense, domain already resolved) — no hardcoded stopword/domain
+    lists needed here anymore, just append the language filter.
     """
-    # Words that convey direction/action — keep them
-    KEEP = {"to", "from", "into", "convert", "parse", "generate",
-            "extract", "transform", "export", "import", "read", "write"}
-    # Generic noise to drop
-    DROP = {"a", "an", "the", "and", "or", "for", "with", "use",
-            "using", "build", "create", "make", "app", "project",
-            "i", "me", "my", "we", "please", "help"}
-
-    tokens = re.findall(r"[a-zA-Z0-9_\-]+", task.lower())
-    keywords = [t for t in tokens if t not in DROP or t in KEEP]
-
-    # Detect ML/vision tasks to add domain hint
-    ml_words = {"image", "photo", "detection", "classify", "nlp",
-                "sentiment", "speech", "ocr", "train", "model"}
-    is_ml = any(w in ml_words for w in keywords)
-
-    suffix = "python machine-learning" if is_ml else "python"
-    return " ".join(keywords[:6]) + " " + suffix
+    return f"{query} python"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LLM ranking — semantic match with direction enforcement
+#  Embedding ranking — local sentence-transformers, no LLM call
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Ranking is the heaviest LLM call in the pipeline (800 max_tokens vs. 20 for
+# normalization), and it operates over a fixed, already-fetched candidate
+# list — a task that local models handle well, without any external API
+# call, cost, or rate limit. Only `_normalize_query()` still calls the LLM
+# (needed so Serper/GitHub's literal keyword search retrieves the same
+# candidates regardless of phrasing — something local ranking alone can't
+# fix since it only ranks AFTER retrieval).
+#
+# Two-stage retrieve-then-rerank, the standard IR pattern — but with only
+# MAX_CANDIDATES candidates total (not millions of documents), the "narrow the field
+# with a cheap bi-encoder first" step isn't earning its keep: it was cutting
+# the shortlist to the top 8 by cosine similarity, which pruned candidates
+# like `sloria/TextBlob` (9.5k★) before the cross-encoder ever saw them —
+# TextBlob's description covers several capabilities (POS tagging,
+# translation, ...) alongside sentiment analysis, which dilutes its bi-
+# encoder cosine similarity against narrower single-purpose repos, even
+# though it's clearly the better answer once judged properly. Cross-encoding
+# is cheap enough (~0.02s for 4 pairs) to just run over every candidate.
+#   Stage 1 (recall):    bi-encoder cosine similarity — used only as the
+#                         fallback score if the cross-encoder fails to load.
+#   Stage 2 (precision):  cross-encoder reranks ALL candidates — encodes
+#                         (query, repo) jointly, catching things cosine
+#                         similarity blurs together (e.g. platform mismatch:
+#                         Discord vs Telegram bots score nearly identical on
+#                         cosine similarity alone, since the surrounding
+#                         text is otherwise similar).
+
+_EMBED_MODEL  = "all-MiniLM-L6-v2"                        # same model rag.py uses
+_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+_embedder  = None
+_reranker  = None
+
+def _get_embedder():
+    global _embedder
+    if _embedder is None:
+        import warnings
+        warnings.filterwarnings("ignore")
+        from sentence_transformers import SentenceTransformer
+        _embedder = SentenceTransformer(_EMBED_MODEL)
+    return _embedder
+
+
+def _get_reranker():
+    global _reranker
+    if _reranker is None:
+        import warnings
+        warnings.filterwarnings("ignore")
+        from sentence_transformers import CrossEncoder
+        _reranker = CrossEncoder(_RERANK_MODEL)
+    return _reranker
+
+
+def _repo_text(r: dict) -> str:
+    return (
+        f"{r.get('name', '')}: {r.get('snippet', '')} "
+        f"[{', '.join(r.get('topics') or [])}]"
+    )
+
+
+def _to_result(r: dict, sem_score: float) -> dict:
+    stars_int = r.get("stars_int", 0)
+    combined  = round(sem_score * 0.6 + _star_weight(stars_int) * 0.4, 2)
+    return {
+        "full_name":    r["full_name"],
+        "name":         r["name"],
+        "owner":        r["owner"],
+        "stars":        _fmt_stars(stars_int),
+        "language":     r.get("language", "Python"),
+        "description":  r.get("snippet", "")[:150],
+        "icon":         "📦",
+        "score":        combined,
+        "_sem_score":   round(sem_score, 2),
+        "_star_weight": round(_star_weight(stars_int), 2),
+    }
+
+
+def _embed_rank(repos: list[dict], task: str) -> list[dict]:
+    # ── Stage 1: bi-encoder scores — fallback only if reranking fails ───
+    model     = _get_embedder()
+    texts     = [_repo_text(r) for r in repos]
+    task_emb  = model.encode(task, normalize_embeddings=True)
+    repo_embs = model.encode(texts, normalize_embeddings=True)
+
+    scored = []
+    for r, emb in zip(repos, repo_embs):
+        cos_sim   = float(task_emb @ emb)        # normalized → dot == cosine
+        sem_score = max(0.0, min(10.0, cos_sim * 10))
+        scored.append((r, sem_score))
+
+    # ── Stage 2: cross-encoder reranks every candidate ───────────────────
+    # Raw logits from ms-marco-MiniLM run well past +5/-5 for anything
+    # clearly relevant/irrelevant, so a sigmoid squash would saturate most
+    # of them to ~10 and destroy differentiation. Min-max normalize across
+    # the candidate set instead — we only need correct RELATIVE order, not
+    # a globally calibrated scale.
+    try:
+        reranker = _get_reranker()
+        pairs    = [(task, _repo_text(r)) for r, _ in scored]
+        logits   = [float(x) for x in reranker.predict(pairs)]
+        lo, hi   = min(logits), max(logits)
+        spread   = hi - lo
+        scored = [
+            (r, ((logit - lo) / spread * 10) if spread > 1e-6 else 5.0)
+            for (r, _), logit in zip(scored, logits)
+        ]
+    except Exception as e:
+        log.warning("Cross-encoder rerank failed, using bi-encoder scores: %s", e)
+
+    result = [_to_result(r, s) for r, s in scored]
+    result.sort(key=lambda x: -x["score"])
+    return result
+
 
 async def _rank_repos(repos: list[dict], task: str) -> list[dict]:
-    # Build a lookup so we can inject real stars after LLM ranking
-    stars_map = {r["full_name"]: r.get("stars_int", 0) for r in repos}
-    lang_map  = {r["full_name"]: r.get("language", "Python") for r in repos}
-
-    listing = "\n".join(
-        f"{i}. {r['full_name']} ★{_fmt_stars(r.get('stars_int', 0))}"
-        f"\n   {r.get('snippet', '')[:150]}"
-        for i, r in enumerate(repos[:10])
-    )
-
-    system = (
-        "You are a precise GitHub repo ranker. "
-        "Return ONLY valid JSON — no markdown, no explanation.\n"
-        'Shape: {"repos": [{"full_name":"...","name":"...","owner":"...",'
-        '"stars":"12k","language":"Python","description":"...","icon":"🔧","score":9.2}]}\n\n'
-        "SCORING RULES (score = semantic relevance only, 0-10):\n"
-        "1. Direction matters: 'json to pdf' means JSON→PDF. "
-        "   A repo doing the reverse scores 0.\n"
-        "2. Score 9-10: does exactly what the task asks.\n"
-        "3. Score 5-8: related but not a perfect match.\n"
-        "4. Score 0-2: does the opposite or is unrelated.\n"
-        "5. Among repos with the same semantic score, prefer higher-starred ones.\n"
-        "6. Never invent repos not in the list. Return all repos sorted best-first."
-    )
-
-    user = (
-        f"TASK (direction matters): {task}\n\n"
-        f"REPOS (with real star counts):\n{listing}\n\n"
-        f"Score each repo 0-10 for semantic match. "
-        f"Reverse-direction repos get 0. Higher stars break ties."
-    )
-
+    candidates = repos[:MAX_CANDIDATES]
     try:
-        raw    = await llm_chat(system=system, user=user,
-                                max_tokens=800, temperature=0.1)
-        ranked = _parse_json(raw)
-        if not (isinstance(ranked, dict) and isinstance(ranked.get("repos"), list)):
-            raise ValueError("bad shape")
-
-        result = []
-        for r in ranked["repos"]:
-            fn          = r.get("full_name", "")
-            stars_int   = stars_map.get(fn, 0)
-            sem_score   = float(r.get("score", 5))
-            # Combined score: 60% semantic + 40% star weight
-            combined    = round(sem_score * 0.6 + _star_weight(stars_int) * 0.4, 2)
-            result.append({
-                **r,
-                "stars":        _fmt_stars(stars_int),
-                "language":     r.get("language") or lang_map.get(fn, "Python"),
-                "score":        combined,
-                "_sem_score":   sem_score,
-                "_star_weight": round(_star_weight(stars_int), 2),
-            })
-
-        # Re-sort by combined score descending
-        result.sort(key=lambda x: -x["score"])
-        return result
-
-    except Exception:
-        # Fallback: sort by stars, no LLM
-        sorted_repos = sorted(repos[:10], key=lambda r: -r.get("stars_int", 0))
+        return await asyncio.to_thread(_embed_rank, candidates, task)
+    except Exception as e:
+        log.warning("Embedding ranking failed, falling back to star sort: %s", e)
+        sorted_repos = sorted(candidates, key=lambda r: -r.get("stars_int", 0))
         return [
             {
                 "full_name":   r["full_name"],
@@ -345,6 +526,34 @@ async def _rank_repos(repos: list[dict], task: str) -> list[dict]:
             }
             for i, r in enumerate(sorted_repos[:3])
         ]
+
+
+async def _llm_recall_repos(task: str) -> list[dict]:
+    """
+    Last-resort fallback when Serper, GitHub Search, and Jina all return
+    zero candidates (e.g. simultaneous outage/rate-limit). Asks the LLM to
+    recall real, well-known GitHub repos for the task from training
+    knowledge — keyed off the actual query, not a hardcoded topic table.
+    Star counts here are the LLM's recollection, not live data, so they're
+    approximate; the repo still gets re-verified (README fetch, clone) once
+    selected downstream.
+    """
+    system = (
+        "Name up to 3 REAL, well-known GitHub repositories (owner/repo, "
+        "must actually exist) that best accomplish the given task. "
+        "Return ONLY valid JSON: "
+        '{"repos": [{"full_name":"owner/repo","name":"repo","owner":"owner",'
+        '"stars":"12k","language":"Python","description":"...","icon":"🔧","score":8.5}]} '
+        "Never invent a repo you are not confident exists."
+    )
+    try:
+        raw = await llm_chat(system=system, user=task, max_tokens=500, temperature=0.2)
+        parsed = _parse_json(raw)
+        repos = parsed.get("repos", []) if isinstance(parsed, dict) else []
+        return [r for r in repos if r.get("full_name")][:3]
+    except Exception as e:
+        log.warning("LLM repo recall failed: %s", e)
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
