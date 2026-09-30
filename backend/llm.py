@@ -26,7 +26,7 @@ async def chat(
     key2  = os.getenv("GROQ_API_KEY_2", "")
     key3  = os.getenv("GROQ_API_KEY_3", "")
     key4  = os.getenv("GROQ_API_KEY_4", "")
-    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
     if not any([key1, key2, key3, key4]):
         raise RuntimeError(

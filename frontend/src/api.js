@@ -280,6 +280,44 @@ export function streamTest(repoFullName, jobId, onEvent) {
   return () => controller.abort()
 }
 
+export function streamAutofix(repoFullName, jobId, onEvent) {
+  const controller = new AbortController()
+  const token      = getToken()
+
+  fetch(`${BASE}/autofix`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ repo_full_name: repoFullName, job_id: jobId || '' }),
+    signal: controller.signal,
+  }).then(async res => {
+    if (!res.ok) { onEvent({ type: 'error', title: 'Error', body: await res.text() }); return }
+    const reader  = res.body.getReader()
+    const decoder = new TextDecoder()
+    let   buffer  = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop()
+      for (const part of parts) {
+        const line = part.trim()
+        if (line.startsWith('data: ')) {
+          try { onEvent(JSON.parse(line.slice(6))) } catch {}
+        }
+      }
+    }
+  }).catch(err => {
+    if (err.name !== 'AbortError')
+      onEvent({ type: 'error', title: 'Connection error', body: err.message })
+  })
+
+  return () => controller.abort()
+}
+
 export async function submitCredentials(jobId, credentials) {
   const res = await apiFetch(`${BASE}/credentials/${jobId}`, {
     method: 'POST',

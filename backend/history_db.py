@@ -23,6 +23,7 @@ async def history_create(user_id: str, task: str, repos: list) -> str:
         "repos":      repos,           # top-3 search results
         "selected_repo": None,
         "analysis":   None,
+        "architecture": None,
         "execution":  None,
         "audit":      None,
         "job_id":     "",

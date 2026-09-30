@@ -54,6 +54,7 @@ import shutil
 import sys
 import tempfile
 import importlib
+import importlib.abc
 import importlib.util
 import importlib.machinery
 from collections import defaultdict, deque
@@ -569,6 +570,16 @@ class _ImportTracer:
 
     Records every (caller_module, imported_module) pair where BOTH
     modules are inside the target workspace.
+
+    The caller context (`_call_stack`) is only accurate for imports
+    triggered WHILE an in-repo module's own top-level code is executing —
+    not just for the outermost `import_module()` call. `find_spec()` fires
+    before a module is loaded, so to know when THIS module's body starts
+    and finishes running (and therefore when to push/pop it as the current
+    caller), we wrap its loader's `exec_module()` rather than push once per
+    outer entry-point call. Without this, every import triggered anywhere
+    inside a deep import chain gets misattributed to the top-level entry
+    module instead of its true immediate parent.
     """
 
     def __init__(self, workspace: str, repo_mod_keys: set[str]):
@@ -593,7 +604,34 @@ class _ImportTracer:
                     if (caller_key in self.repo_mod_keys and
                             target_key in self.repo_mod_keys):
                         self.edges[(caller_key, target_key)] += 1
-        return None  # Don't actually handle loading — let normal finders do it
+
+        # Only wrap loading for modules that are actually part of the repo —
+        # for stdlib/third-party imports we stay a pure observer and let the
+        # normal finders handle everything, untouched.
+        if self._to_mod_key(fullname) is None:
+            return None
+
+        # Ask every OTHER finder for the real spec (skip self to avoid
+        # recursing back into this method), so we can wrap its loader.
+        real_spec = None
+        for finder in sys.meta_path:
+            if finder is self:
+                continue
+            find = getattr(finder, "find_spec", None)
+            if find is None:
+                continue
+            try:
+                real_spec = find(fullname, path, target)
+            except Exception:
+                real_spec = None
+            if real_spec is not None:
+                break
+
+        if real_spec is None or real_spec.loader is None:
+            return None  # can't wrap what we can't find — let default machinery try
+
+        real_spec.loader = _TracingLoaderProxy(real_spec.loader, fullname, self)
+        return real_spec
 
     def _to_mod_key(self, name: str) -> str | None:
         # Strip trailing __init__
@@ -602,6 +640,36 @@ class _ImportTracer:
             parts = parts[:-1]
         key = ".".join(parts)
         return key if key in self.repo_mod_keys else None
+
+
+class _TracingLoaderProxy(importlib.abc.Loader):
+    """
+    Wraps a module's real loader so `_ImportTracer` knows exactly when that
+    module's own top-level code starts and finishes executing — the window
+    during which any imports IT makes should be attributed to it, not to
+    whatever module was importing at the outer level.
+    """
+
+    def __init__(self, real_loader, fullname: str, tracer: "_ImportTracer"):
+        self._real     = real_loader
+        self._fullname = fullname
+        self._tracer   = tracer
+
+    def create_module(self, spec):
+        # Per PEP 451, returning None here means "use default module
+        # creation" — most loaders (e.g. SourceFileLoader) rely on that
+        # default rather than overriding create_module themselves.
+        create = getattr(self._real, "create_module", None)
+        return create(spec) if create else None
+
+    def exec_module(self, module):
+        self._tracer._call_stack.append(self._fullname)
+        try:
+            self._real.exec_module(module)
+        finally:
+            if (self._tracer._call_stack and
+                    self._tracer._call_stack[-1] == self._fullname):
+                self._tracer._call_stack.pop()
 
 
 def _build_mdg_runtime(workspace: str, parsed_files: list[dict]) -> list[dict]:

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { jsPDF } from 'jspdf'
-import { streamTest } from '../api'
+import { streamTest, streamAutofix } from '../api'
 
 // ── Scanner metadata ─────────────────────────────────────────────────────────
 const SCANNERS = [
@@ -10,7 +10,7 @@ const SCANNERS = [
   { id: 'types',    name: 'Type Analysis',    icon: '🔬', tool: 'mypy'           },
   { id: 'secrets',  name: 'Secret Detection', icon: '🔑', tool: 'detect-secrets' },
   { id: 'deadcode', name: 'Dead Code',        icon: '💀', tool: 'vulture'        },
-  { id: 'coverage', name: 'Test Coverage',    icon: '🧪', tool: 'pytest-cov'    },
+  { id: 'semgrep',  name: 'Pattern Analysis', icon: '🧩', tool: 'semgrep'        },
 ]
 
 // ── Severity config ───────────────────────────────────────────────────────────
@@ -30,6 +30,22 @@ const GRADE_STYLE = {
   F: { color: '#f87171', bg: 'rgba(248,113,113,0.15)',  border: '#f87171' },
 }
 
+// Short scanner labels for the PDF's compact rows — jsPDF's built-in fonts
+// only support WinAnsi encoding, and the full names ("Dependency CVEs",
+// "Secret Detection") don't fit the narrow column without an ugly mid-word
+// cut, so we use a dedicated short form there instead of slicing sc.name.
+const SCANNER_SHORT = {
+  lint: 'Lint', security: 'Security', deps: 'Dep CVEs',
+  types: 'Types', secrets: 'Secrets', deadcode: 'Dead Code', semgrep: 'Semgrep',
+}
+
+// Per-finding weight = midpoint of the finding's CVSS v3.1 qualitative
+// severity band (FIRST.org / NIST NVD standard: None 0.0, Low 0.1-3.9,
+// Medium 4.0-6.9, High 7.0-8.9, Critical 9.0-10.0). Must match backend
+// tester.py's CVSS_WEIGHTS — used here only to *display* each severity's
+// share of risk exposure; the score itself always comes from the backend.
+const CVSS_WEIGHTS = { critical: 9.5, high: 8.0, medium: 5.5, low: 2.0, info: 0.0 }
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, go }) {
@@ -42,19 +58,22 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
   const [sevFilter, setSevFilter]   = useState('all')
   const [scanFilter, setScanFilter] = useState('all')
   const [expandedFinding, setExpandedFinding] = useState(null)
+  const [autofixPhase, setAutofixPhase] = useState('idle')   // idle | running | done | nofix | error
+  const [autofixLog, setAutofixLog]     = useState([])       // [{text, type}]
+  const [autofixResult, setAutofixResult] = useState(null)   // {pr_url, branch, files_changed, fixes}
   const cleanupRef = useRef(null)
+  const autofixCleanupRef = useRef(null)
   const logEndRef  = useRef(null)
 
   function downloadReport() {
     if (!report) return
 
-    const doc  = new jsPDF({ unit: 'mm', format: 'a4' })
-    const PW   = 210   // page width
-    const PH   = 297   // page height
-    const ML   = 14    // margin left
-    const MR   = 14    // margin right
-    const CW   = PW - ML - MR  // content width
-    let   y    = 0
+    const PW = 210   // page width
+    const PH = 297   // page height
+    const ML = 14    // margin left
+    const MR = 14    // margin right
+    const CW = PW - ML - MR  // content width
+    const MAX_PAGES = 2   // keep the summary short — an index, not a full dump
 
     const SEV_RGB = {
       critical: [248, 113, 113],
@@ -67,13 +86,134 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
       A: [52, 211, 153], B: [93, 142, 255],
       C: [251, 191, 36], D: [251, 146, 60], F: [248, 113, 113],
     }
+    const sevRank = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
 
-    function newPage() {
-      doc.addPage()
-      y = 16
+    const slug        = (report.repo || 'report').replace(/\//g, '_')
+    const summaryFile  = `audit_summary_${slug}.pdf`
+    const detailsFile  = `audit_details_${slug}.pdf`
+
+    // ── Group findings into issue types (same scanner + rule) ────────────────
+    // The summary links to a group, not to every individual occurrence — that
+    // keeps the summary short while still getting you straight to everything
+    // related to a given error in the details PDF.
+    const groupMap = new Map()
+    for (const f of (report.findings || [])) {
+      const key = `${f.scanner}::${f.rule || f.message}`
+      let g = groupMap.get(key)
+      if (!g) {
+        g = { scanner: f.scanner, rule: f.rule, severity: f.severity, message: f.message, items: [] }
+        groupMap.set(key, g)
+      }
+      g.items.push(f)
+      if (sevRank[f.severity] < sevRank[g.severity]) g.severity = f.severity
     }
-    function checkY(needed = 12) {
-      if (y + needed > PH - 14) newPage()
+    const groups = [...groupMap.values()].sort((a, b) =>
+      (sevRank[a.severity] ?? 5) - (sevRank[b.severity] ?? 5) || b.items.length - a.items.length)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 1) DETAILS PDF — every occurrence, grouped by issue type. Unbounded
+    //    length (it's the appendix), but styled to match the summary.
+    // ══════════════════════════════════════════════════════════════════════
+    const details = new jsPDF({ unit: 'mm', format: 'a4' })
+    let dy = 0
+
+    function dNewPage() { details.addPage(); dy = 18 }
+    function dCheck(needed = 10) { if (dy + needed > PH - 14) dNewPage() }
+
+    details.setFillColor(15, 15, 17)
+    details.rect(0, 0, PW, 20, 'F')
+    details.setTextColor(232, 232, 240)
+    details.setFontSize(12)
+    details.setFont('helvetica', 'bold')
+    details.text('Code Audit — Detailed Findings', ML, 9)
+    details.setFontSize(7.5)
+    details.setFont('helvetica', 'normal')
+    details.setTextColor(136, 136, 160)
+    details.text(report.repo || '', ML, 15)
+    details.text('RepoSage', PW - MR, 15, { align: 'right' })
+    dy = 26
+
+    details.setFont('helvetica', 'italic')
+    details.setFontSize(7.5)
+    details.setTextColor(130, 130, 150)
+    details.text(`Companion to ${summaryFile} — keep both files in the same folder for the "view »" links to work.`, ML, dy)
+    dy += 9
+
+    groups.forEach((g, gi) => {
+      dCheck(18)
+      // Record the page this group starts on, so the summary can link to it.
+      g.page = details.internal.getCurrentPageInfo().pageNumber
+
+      const [r, gg, b] = SEV_RGB[g.severity] || [136, 136, 160]
+      details.setFillColor(r, gg, b)
+      details.roundedRect(ML, dy - 4.5, CW, 7.5, 1.2, 1.2, 'F')
+      details.setTextColor(255, 255, 255)
+      details.setFontSize(8)
+      details.setFont('helvetica', 'bold')
+      const sc = SCANNERS.find(s => s.id === g.scanner)
+      details.text(`${g.severity.toUpperCase()}  ·  ${SCANNER_SHORT[g.scanner] || sc?.name || g.scanner}${g.rule ? '  ·  ' + g.rule : ''}`, ML + 2.5, dy)
+      details.text(`${g.items.length} occurrence${g.items.length !== 1 ? 's' : ''}`, PW - MR - 2, dy, { align: 'right' })
+      dy += 7
+
+      details.setFont('helvetica', 'normal')
+      details.setFontSize(7.5)
+      details.setTextColor(60, 60, 75)
+      const msgLines = details.splitTextToSize(g.message || '', CW - 4)
+      details.text(msgLines.slice(0, 2), ML + 1, dy)
+      dy += Math.min(msgLines.length, 2) * 3.8 + 4
+
+      g.items.forEach((f, i) => {
+        dCheck(6)
+        if (i % 2 === 0) {
+          details.setFillColor(246, 246, 249)
+          details.rect(ML, dy - 3.2, CW, 5.6, 'F')
+        }
+        details.setFont('helvetica', 'normal')
+        details.setFontSize(7)
+        details.setTextColor(90, 90, 105)
+        const loc = (f.file || '') + (f.line ? `:${f.line}` : '')
+        details.text(loc.length > 70 ? '…' + loc.slice(-69) : (loc || '—'), ML + 1, dy)
+        if (f.confidence) {
+          details.setTextColor(93, 142, 255)
+          details.text(String(f.confidence), PW - MR, dy, { align: 'right' })
+        }
+        dy += 5.6
+      })
+
+      dy += 4
+      if (gi < groups.length - 1) {
+        details.setDrawColor(228, 228, 233)
+        details.setLineWidth(0.15)
+        details.line(ML, dy - 2.5, PW - MR, dy - 2.5)
+      }
+    })
+
+    const dPageCount = details.getNumberOfPages()
+    for (let i = 1; i <= dPageCount; i++) {
+      details.setPage(i)
+      details.setFontSize(7)
+      details.setTextColor(160, 160, 180)
+      details.text(`Page ${i} of ${dPageCount}`, PW / 2, PH - 6, { align: 'center' })
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 2) SUMMARY PDF — header / grade / severity / scanner breakdown, then a
+    //    clickable issue index (max MAX_PAGES pages) linking into the
+    //    details PDF above.
+    // ══════════════════════════════════════════════════════════════════════
+    const doc = new jsPDF({ unit: 'mm', format: 'a4' })
+    let y = 0
+    let pageNum = 1
+
+    // Advances to a new page only if one is still allowed; returns false once
+    // the page budget (MAX_PAGES) is exhausted, so callers know to stop.
+    function ensureRoom(needed = 12) {
+      if (y + needed <= PH - 12) return true
+      if (pageNum >= MAX_PAGES) return false
+      doc.addPage()
+      pageNum++
+      y = 16
+      return true
     }
     function hline(yy, r = 200, g = 200, b = 200) {
       doc.setDrawColor(r, g, b)
@@ -171,90 +311,111 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
       }
       doc.setTextColor(cnt > 0 ? 93 : 120, cnt > 0 ? 142 : 120, cnt > 0 ? 255 : 120)
       doc.text(String(cnt), PW - MR, y, { align: 'right' })
-      y += 6
+      y += 5
     })
-    y += 2
-    hline(y); y += 8
+    y += 1
+    hline(y); y += 7
 
-    // ── Findings ──────────────────────────────────────────────────────────────
+    // ── Issue index (compact, one row per issue type, links into the
+    //    details PDF; capped to MAX_PAGES to keep the summary short) ─────────
+    const totalFindings = (report.findings || []).length
     doc.setFontSize(8)
     doc.setFont('helvetica', 'bold')
     doc.setTextColor(80, 80, 100)
-    doc.text(`FINDINGS  (${(report.findings || []).length} total)`, ML, y)
+    doc.text(
+      `ISSUE INDEX  (${groups.length} issue type${groups.length !== 1 ? 's' : ''} · ${totalFindings} finding${totalFindings !== 1 ? 's' : ''} — tap a row to open it in the details PDF)`,
+      ML, y)
     y += 6
 
-    const findings = [...(report.findings || [])].sort((a, b) => {
-      const order = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
-      return (order[a.severity] ?? 5) - (order[b.severity] ?? 5)
-    })
-
+    const ROW_H = 6.2
     let lastSev = null
-    for (const f of findings) {
-      checkY(16)
+    let shown = 0
+    for (const g of groups) {
+      const needsHeader = g.severity !== lastSev
+      if (!ensureRoom(ROW_H + (needsHeader ? 5 : 0))) break
 
       // Severity section header when it changes
-      if (f.severity !== lastSev) {
-        if (lastSev !== null) { y += 2 }
-        const [r, g, b] = SEV_RGB[f.severity] || [136, 136, 160]
-        doc.setFillColor(r, g, b)
-        doc.roundedRect(ML, y - 4, CW, 6, 1, 1, 'F')
+      if (needsHeader) {
+        const [r, g_, b] = SEV_RGB[g.severity] || [136, 136, 160]
+        doc.setFillColor(r, g_, b)
+        doc.roundedRect(ML, y - 3.5, CW, 5, 1, 1, 'F')
         doc.setTextColor(255, 255, 255)
-        doc.setFontSize(7)
-        doc.setFont('helvetica', 'bold')
-        doc.text(f.severity.toUpperCase(), ML + 2, y)
-        y += 5
-        lastSev = f.severity
-      }
-
-      checkY(14)
-
-      // Finding row background (alternating)
-      doc.setFillColor(245, 245, 248)
-      doc.rect(ML, y - 3, CW, 11, 'F')
-
-      // Scanner icon area
-      const sc = SCANNERS.find(s => s.id === f.scanner)
-      doc.setTextColor(80, 80, 100)
-      doc.setFontSize(7)
-      doc.setFont('helvetica', 'bold')
-      doc.text(sc?.name || f.scanner, ML + 1, y + 2)
-
-      // Rule code
-      if (f.rule) {
-        doc.setTextColor(93, 142, 255)
-        doc.setFontSize(7)
-        doc.text(f.rule, ML + 26, y + 2)
-      }
-
-      // File:line
-      if (f.file) {
-        const loc = f.file + (f.line ? `:${f.line}` : '')
-        doc.setTextColor(130, 130, 150)
         doc.setFontSize(6.5)
-        doc.text(loc.length > 40 ? '…' + loc.slice(-39) : loc, ML + 48, y + 2)
+        doc.setFont('helvetica', 'bold')
+        doc.text(g.severity.toUpperCase(), ML + 2, y)
+        y += 5
+        lastSev = g.severity
       }
 
-      // Message (wrap to 2 lines max)
-      doc.setTextColor(40, 40, 50)
+      const rowTop = y - 3.5
+
+      // Row background (alternating)
+      if (shown % 2 === 0) {
+        doc.setFillColor(246, 246, 249)
+        doc.rect(ML, rowTop, CW, ROW_H, 'F')
+      }
+
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(7)
+      doc.setTextColor(80, 80, 100)
+      doc.text(SCANNER_SHORT[g.scanner] || g.scanner, ML + 1.5, y + 0.7)
+
+      const countW = 18
+      const linkW  = 16
+      const msgX   = ML + 25
+      const msgW   = CW - 25 - countW - linkW - 3
       doc.setFont('helvetica', 'normal')
       doc.setFontSize(7)
-      const msgLines = doc.splitTextToSize(f.message || '', CW - 4)
-      doc.text(msgLines.slice(0, 2), ML + 1, y + 7)
+      doc.setTextColor(40, 40, 50)
+      const label = g.rule ? `${g.rule} — ${g.message}` : g.message
+      const oneLine = doc.splitTextToSize(label || '', msgW)[0] || ''
+      doc.text(oneLine, msgX, y + 0.7)
 
-      y += msgLines.length > 1 ? 14 : 11
+      doc.setFont('helvetica', 'normal')
+      doc.setFontSize(6.5)
+      doc.setTextColor(120, 120, 140)
+      doc.text(`×${g.items.length}`, PW - MR - linkW - 2, y + 0.7, { align: 'right' })
+
+      // Clickable link — jumps straight to this issue's section in the
+      // details PDF (relative file link with a #page= anchor).
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(6.5)
+      doc.setTextColor(93, 142, 255)
+      doc.text('view »', PW - MR, y + 0.7, { align: 'right' })
+      doc.link(ML, rowTop, CW, ROW_H, { url: `${detailsFile}#page=${g.page}` })
+
+      y += ROW_H
+      shown++
     }
 
-    // ── Footer on every page ─────────────────────────────────────────────────
+    const remaining = groups.length - shown
+    if (remaining > 0 && ensureRoom(7)) {
+      doc.setFont('helvetica', 'italic')
+      doc.setFontSize(7.5)
+      doc.setTextColor(120, 120, 140)
+      doc.text(
+        `+ ${remaining} more issue type(s) not shown — open ${detailsFile} for the full list.`,
+        ML, y + 3)
+      y += 7
+    }
+
+    // ── Footer note + page numbers on every page ──────────────────────────────
     const pageCount = doc.getNumberOfPages()
     for (let i = 1; i <= pageCount; i++) {
       doc.setPage(i)
+      doc.setFontSize(6.5)
+      doc.setTextColor(170, 170, 190)
+      doc.text(`Full details: ${detailsFile}`, ML, PH - 6)
       doc.setFontSize(7)
       doc.setTextColor(160, 160, 180)
       doc.text(`Page ${i} of ${pageCount}`, PW / 2, PH - 6, { align: 'center' })
     }
 
-    const slug = (report.repo || 'report').replace(/\//g, '_')
-    doc.save(`audit_${slug}.pdf`)
+    // Save both. The details PDF first, then the summary a beat later —
+    // browsers can silently block a second simultaneous download from the
+    // same click handler otherwise.
+    details.save(detailsFile)
+    setTimeout(() => doc.save(summaryFile), 350)
   }
 
   useEffect(() => {
@@ -328,6 +489,56 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
     setLog(prev => [...prev, { text, type }])
   }
 
+  // ── Semgrep autofix → pull request ──────────────────────────────────────────
+
+  function startAutofix() {
+    if (!selectedRepo) return
+    const ok = window.confirm(
+      `This runs Semgrep's autofix on ${selectedRepo.full_name}, then pushes a new branch ` +
+      `(forking the repo first if needed) and opens a pull request for review. It never commits ` +
+      `to the default branch directly. Continue?`
+    )
+    if (!ok) return
+
+    setAutofixPhase('running')
+    setAutofixLog([])
+    setAutofixResult(null)
+
+    const cleanup = streamAutofix(selectedRepo.full_name, jobId || '', (ev) => {
+      if (ev.type === 'error') {
+        setAutofixPhase('error')
+        addAutofixLog(ev.body || 'Unknown error', 'error')
+        return
+      }
+      if (ev.type === 'status') {
+        addAutofixLog(ev.title + (ev.body ? ` — ${ev.body}` : ''), 'status')
+        return
+      }
+      if (ev.type === 'done') {
+        if (ev.pr_url) {
+          setAutofixPhase('done')
+          setAutofixResult(ev)
+          addAutofixLog('✓ Pull request opened', 'done')
+        } else {
+          setAutofixPhase('nofix')
+          addAutofixLog(ev.body || 'No autofixable findings.', 'status')
+        }
+      }
+    })
+
+    autofixCleanupRef.current = cleanup
+  }
+
+  function stopAutofix() {
+    autofixCleanupRef.current?.()
+    setAutofixPhase('idle')
+    addAutofixLog('Autofix stopped by user.', 'warning')
+  }
+
+  function addAutofixLog(text, type = 'status') {
+    setAutofixLog(prev => [...prev, { text, type }])
+  }
+
   // ── Findings helpers ────────────────────────────────────────────────────────
 
   const findings = report?.findings || []
@@ -381,14 +592,102 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
               {report && (
                 <button
                   onClick={downloadReport}
+                  title="Downloads two PDFs: a short summary with clickable links, and a details file with every finding"
                   style={{ width: '100%', padding: '9px 0', background: 'var(--green-dim)', border: '1px solid var(--green)', borderRadius: 'var(--radius)', color: 'var(--green)', fontSize: 13, fontWeight: 500, cursor: 'pointer' }}
                 >
-                  ↓ Download Report
+                  ↓ Download Report (2 PDFs)
                 </button>
               )}
             </>
           )}
         </div>
+
+        {/* Semgrep autofix → pull request */}
+        {report && (
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
+            <div style={{ fontSize: 11, fontWeight: 500, color: 'var(--txt3)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+              Autofix
+            </div>
+
+            {autofixPhase === 'idle' && (
+              <button
+                onClick={startAutofix}
+                title="Runs semgrep --autofix, then pushes a new branch and opens a pull request (forking first if needed) — never commits to the default branch"
+                style={{ width: '100%', padding: '9px 0', background: 'var(--accent-dim)', border: '1px solid var(--accent)', borderRadius: 'var(--radius)', color: 'var(--accent)', fontSize: 13, fontWeight: 500, cursor: 'pointer' }}
+              >
+                ⚡ Autofix with Semgrep → PR
+              </button>
+            )}
+
+            {autofixPhase === 'running' && (
+              <>
+                <button
+                  onClick={stopAutofix}
+                  style={{ width: '100%', padding: '9px 0', background: 'transparent', border: '1px solid var(--red)', borderRadius: 'var(--radius)', color: 'var(--red)', fontSize: 13, fontWeight: 500, cursor: 'pointer', marginBottom: 8 }}
+                >
+                  ■  Stop
+                </button>
+                <div style={{ fontSize: 11, fontFamily: 'var(--mono)', lineHeight: 1.6, maxHeight: 120, overflowY: 'auto' }}>
+                  {autofixLog.map((entry, i) => (
+                    <div key={i} style={{ color: entry.type === 'error' ? 'var(--red)' : entry.type === 'done' ? 'var(--green)' : 'var(--txt2)', marginBottom: 3 }}>
+                      <span className="pulse">●</span> {entry.text}
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {autofixPhase === 'done' && autofixResult && (
+              <div>
+                <div style={{ fontSize: 12, color: 'var(--green)', marginBottom: 8 }}>
+                  ✓ PR opened — {autofixResult.fixes} fix(es) across {autofixResult.files_changed} file(s)
+                </div>
+                <a
+                  href={autofixResult.pr_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ display: 'block', textAlign: 'center', padding: '9px 0', background: 'var(--green-dim)', border: '1px solid var(--green)', borderRadius: 'var(--radius)', color: 'var(--green)', fontSize: 13, fontWeight: 500, textDecoration: 'none' }}
+                >
+                  ↗ View Pull Request
+                </a>
+                <button
+                  onClick={() => { setAutofixPhase('idle'); setAutofixResult(null); setAutofixLog([]) }}
+                  style={{ width: '100%', padding: '7px 0', marginTop: 6, background: 'transparent', border: '1px solid var(--border2)', borderRadius: 'var(--radius)', color: 'var(--txt2)', fontSize: 12, cursor: 'pointer' }}
+                >
+                  Run again
+                </button>
+              </div>
+            )}
+
+            {autofixPhase === 'nofix' && (
+              <div>
+                <div style={{ fontSize: 12, color: 'var(--txt3)', marginBottom: 8 }}>
+                  {autofixLog[autofixLog.length - 1]?.text || 'No autofixable findings.'}
+                </div>
+                <button
+                  onClick={startAutofix}
+                  style={{ width: '100%', padding: '8px 0', background: 'transparent', border: '1px solid var(--border2)', borderRadius: 'var(--radius)', color: 'var(--txt)', fontSize: 12, cursor: 'pointer' }}
+                >
+                  ↺  Try again
+                </button>
+              </div>
+            )}
+
+            {autofixPhase === 'error' && (
+              <div>
+                <div style={{ fontSize: 12, color: 'var(--red)', marginBottom: 8 }}>
+                  {autofixLog.find(l => l.type === 'error')?.text || 'Autofix failed.'}
+                </div>
+                <button
+                  onClick={startAutofix}
+                  style={{ width: '100%', padding: '8px 0', background: 'transparent', border: '1px solid var(--red)', borderRadius: 'var(--radius)', color: 'var(--red)', fontSize: 12, cursor: 'pointer' }}
+                >
+                  ↺  Retry
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Scanner cards */}
         <div style={{ padding: '10px 12px 0', overflowY: 'auto', flex: 1 }}>
@@ -465,7 +764,7 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
             <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--txt2)' }}>Python Code Audit</div>
             <div style={{ maxWidth: 420, fontSize: 13, lineHeight: 1.7, color: 'var(--txt3)' }}>
               Runs 7 static analysis tools on <strong style={{ color: 'var(--txt2)' }}>{selectedRepo?.full_name || 'the selected repo'}</strong>:<br/>
-              linting · security · CVEs · types · secrets · dead code · coverage
+              linting · security · CVEs · types · secrets · dead code · patterns
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center', marginTop: 8 }}>
               {SCANNERS.map(sc => (
@@ -661,7 +960,7 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
                   <div style={{ fontSize: 11, fontWeight: 500, color: 'var(--txt2)', marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Score breakdown</div>
                   {['critical','high','medium','low','info'].map(sev => {
                     const cnt = sevCounts[sev] || 0
-                    const penalty = { critical: 20, high: 10, medium: 5, low: 1, info: 0 }[sev] * cnt
+                    const exposure = CVSS_WEIGHTS[sev] * cnt
                     return (
                       <div key={sev} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
                         <span style={{ fontSize: 11, color: SEV[sev].color, width: 56, textTransform: 'capitalize' }}>{sev}</span>
@@ -669,13 +968,16 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
                           <div style={{ height: '100%', width: `${Math.min(100, cnt * 5)}%`, background: SEV[sev].color, borderRadius: 3 }} />
                         </div>
                         <span style={{ fontSize: 11, color: 'var(--txt2)', width: 28, textAlign: 'right' }}>{cnt}</span>
-                        {penalty > 0 && <span style={{ fontSize: 10, color: 'var(--txt3)', width: 44 }}>-{penalty}pts</span>}
+                        {exposure > 0 && <span style={{ fontSize: 10, color: 'var(--txt3)', width: 76, textAlign: 'right' }}>{CVSS_WEIGHTS[sev].toFixed(1)} × {cnt} CVSS</span>}
                       </div>
                     )
                   })}
                   <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--border)', fontSize: 12, display: 'flex', justifyContent: 'space-between' }}>
                     <span style={{ color: 'var(--txt2)' }}>Final score</span>
                     <span style={{ fontWeight: 700, color: GRADE_STYLE[report.grade]?.color }}>{report.score}/100 (Grade {report.grade})</span>
+                  </div>
+                  <div style={{ marginTop: 6, fontSize: 9.5, color: 'var(--txt3)', lineHeight: 1.5 }}>
+                    Score = 100 × e <sup style={{ fontSize: 8 }}>−exposure/40</sup> — exposure is the CVSS-weighted sum of all findings (CVSS v3.1 severity bands). Diminishing marginal penalty per finding, no hard floor at zero.
                   </div>
                 </div>
 

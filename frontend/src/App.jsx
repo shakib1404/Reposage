@@ -42,6 +42,7 @@ export default function App() {
   const [unlocked,     setUnlocked]     = useState(['search'])
   const [task,         setTask]         = useState('')
   const [repos,        setRepos]        = useState([])
+  const [suggestions,  setSuggestions]  = useState([])   // "refine your search" chips
   const [selectedRepo, setSelectedRepo] = useState(null)
   const [analysis,        setAnalysis]        = useState(null)
   const [architectResult, setArchitectResult] = useState(null)
@@ -97,30 +98,36 @@ export default function App() {
     setStep('search')
   }
 
+  // ── Refs that are ALWAYS current — fix stale-closure bug ─────────────────
+  // A plain function defined in the component body captures the state VALUE
+  // from whichever render created it. Pages like SearchPage call unlock(x)
+  // then `setTimeout(() => go(x), 500)` inside one async function — by the
+  // time the timeout fires, App has re-rendered with the new `unlocked`
+  // array, but the `go` closure captured by that setTimeout is still the
+  // OLD one, so `unlocked.includes(x)` reads the stale pre-unlock value and
+  // silently no-ops (unlocked tab shows a checkmark, but the view never
+  // navigates). Using refs lets every callback always read the live value
+  // regardless of when it was made.
+  const userRef       = useRef(user)
+  const taskRef       = useRef(task)
+  const historyIdRef  = useRef(historyId)
+  const jobIdRef      = useRef(jobId)
+  const unlockedRef   = useRef(unlocked)
+
+  useEffect(() => { userRef.current      = user      }, [user])
+  useEffect(() => { taskRef.current      = task      }, [task])
+  useEffect(() => { historyIdRef.current = historyId }, [historyId])
+  useEffect(() => { jobIdRef.current     = jobId     }, [jobId])
+  useEffect(() => { unlockedRef.current  = unlocked  }, [unlocked])
+
   // ── Navigation helpers ────────────────────────────────────────────────────
   const unlock = useCallback(s => {
     setUnlocked(prev => prev.includes(s) ? prev : [...prev, s])
   }, [])
 
   const go = s => {
-    if (unlocked.includes(s) || ALWAYS_ACCESSIBLE.has(s)) setStep(s)
+    if (unlockedRef.current.includes(s) || ALWAYS_ACCESSIBLE.has(s)) setStep(s)
   }
-
-  // ── Refs that are ALWAYS current — fix stale-closure bug ─────────────────
-  // useCallback with state in its deps array captures the state VALUE at the
-  // time the callback was last recreated. Because SearchPage calls setTask(t)
-  // and then setRepos(repos) inside the same async function, the setRepos call
-  // arrives with the OLD callback that still sees task=''. Using refs lets
-  // every callback always read the live value regardless of when it was made.
-  const userRef       = useRef(user)
-  const taskRef       = useRef(task)
-  const historyIdRef  = useRef(historyId)
-  const jobIdRef      = useRef(jobId)
-
-  useEffect(() => { userRef.current      = user      }, [user])
-  useEffect(() => { taskRef.current      = task      }, [task])
-  useEffect(() => { historyIdRef.current = historyId }, [historyId])
-  useEffect(() => { jobIdRef.current     = jobId     }, [jobId])
 
   // ── Stable history-save helpers (empty dep arrays — use refs inside) ─────
 
@@ -158,6 +165,14 @@ export default function App() {
       .catch(e => console.warn('[History] update(analysis) failed:', e.message))
   }, [])
 
+  const handleArchitectResultSet = useCallback(async (data) => {
+    setArchitectResult(data)
+    const hid = historyIdRef.current
+    if (!hid || !data) return
+    updateHistory(hid, { architecture: data })
+      .catch(e => console.warn('[History] update(architecture) failed:', e.message))
+  }, [])
+
   const handleExecResultSet = useCallback(async (result) => {
     setExecResult(result)
     const hid = historyIdRef.current
@@ -193,6 +208,7 @@ export default function App() {
     if (state.repos)        setRepos(state.repos)
     if (state.selectedRepo) setSelectedRepo(state.selectedRepo)
     if (state.analysis)     setAnalysis(state.analysis)
+    if (state.architecture) setArchitectResult(state.architecture)
     if (state.execResult)   setExecResult(state.execResult)
     if (state.testResult)   setTestResult(state.testResult)
     if (state.jobId)      { setJobId(state.jobId);      jobIdRef.current     = state.jobId }
@@ -224,9 +240,10 @@ export default function App() {
   const pageProps = {
     task, setTask,
     repos,           setRepos: handleReposSet,
+    suggestions,     setSuggestions,
     selectedRepo,    setSelectedRepo: handleRepoSelected,
     analysis,        setAnalysis: handleAnalysisSet,
-    architectResult, setArchitectResult,
+    architectResult, setArchitectResult: handleArchitectResultSet,
     chatHistory,     setChatHistory,
     execResult,      setExecResult: handleExecResultSet,
     testResult,      setTestResult: handleTestResultSet,

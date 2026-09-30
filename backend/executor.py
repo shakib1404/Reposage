@@ -33,6 +33,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -54,6 +55,12 @@ CREDENTIAL_TIMEOUT = 300          # seconds to wait for user credentials
 MAX_RETRIES    = int(os.getenv("EXECUTOR_MAX_RETRIES",   "7"))
 SCRIPT_TIMEOUT = int(os.getenv("EXECUTOR_TIMEOUT",       "180"))
 TOKEN_BUDGET   = int(os.getenv("EXECUTOR_TOKEN_BUDGET",  "60000"))
+# How long a detected server (FastAPI/Django/Flask/...) must stay up before
+# we treat it as a confirmed success and close it ourselves — servers never
+# exit 0 on their own, so without this we'd block for the full SCRIPT_TIMEOUT
+# on every single attempt.
+SERVER_CONFIRM_GRACE = int(os.getenv("EXECUTOR_SERVER_GRACE", "10"))
+_RUN_POLL_INTERVAL   = 1.0
 LOG_LEVEL      = os.getenv("EXECUTOR_LOG_LEVEL",         "INFO")
 OUTPUT_ROOT    = os.getenv(
     "EXECUTOR_OUTPUT_ROOT",
@@ -1288,13 +1295,22 @@ Return ONLY valid JSON — no markdown:
 {{
   "fix_type": "install_package|set_env_var|create_file|fix_command|other",
   "root_cause": "Exact root cause in one clear sentence",
-  "explanation": "What this fix does and why (2-3 sentences)",
-  "detail": "Exact fix detail",
+  "explanation": "What this fix does and why (2-3 sentences) — description only, never code",
+  "detail": "One-line human-readable summary of the fix. NEVER put file content or a diff here — it is not applied, it is only shown in logs.",
   "packages_to_install": ["pkg==version"],
   "env_vars_to_set": {{"KEY": "value"}},
-  "files_to_create": [{{"path": "rel/path", "content": "file content"}}],
+  "files_to_create": [{{"path": "rel/path", "content": "COMPLETE new file content"}}],
   "revised_command": "complete corrected shell command if fix_command, else empty"
-}}"""
+}}
+
+CRITICAL: this JSON is applied mechanically — nothing in "explanation" or "detail" ever
+touches disk. If the fix requires ANY change to a source file (existing or new), you MUST
+put the file's COMPLETE new content (the whole file, not a diff/snippet) in
+"files_to_create", using the file's exact existing relative path from REPO FILE TREE so it
+overwrites in place. This applies even when fix_type is "other" — fix_type is just a label,
+files_to_create is what actually takes effect. A fix that only describes a code change in
+words and leaves files_to_create empty will be silently discarded and the exact same failure
+will repeat next attempt."""
 
     try:
         raw = await llm_chat(
@@ -1303,10 +1319,14 @@ Return ONLY valid JSON — no markdown:
                 "Identify the exact root cause and provide a working fix. "
                 "For missing-argument errors, read --help carefully and build "
                 "a complete revised_command with all required options. "
+                "Any fix that edits a source file's contents is only real if the "
+                "complete new file content is placed in files_to_create — prose "
+                "in 'detail' or 'explanation' describing the code change is "
+                "never applied. "
                 "Return ONLY valid JSON. No markdown."
             ),
             user=prompt,
-            max_tokens=1500,
+            max_tokens=3000,
             metrics=metrics,
             temperature=0.1,
         )
@@ -1511,7 +1531,10 @@ async def _build_success_summary(
     try:
         return await llm_chat(
             system="Write a concise, helpful execution summary. No markdown.",
-            user=prompt, max_tokens=200, metrics=metrics, temperature=0.2)
+            # 200 was too tight for a reasoning model (gpt-oss-120b): the
+            # reasoning pass alone can consume the whole budget and return an
+            # empty/truncated summary. The answer is still only 2-3 sentences.
+            user=prompt, max_tokens=800, metrics=metrics, temperature=0.2)
     except Exception:
         return (
             f"✅ Completed in {len(iteration_log)} attempt(s). "
@@ -1800,7 +1823,9 @@ def _python_path(venv_path: str) -> str:
 
 # Candidate interpreter binaries to look for on PATH, newest first so ties
 # in _find_best_python prefer the newer one without extra sorting logic.
-_PYTHON_CANDIDATES = [f"python3.{m}" for m in range(14, 5, -1)]
+# Python 2 hit end-of-life at 2.7 (the only minor version anyone still pins)
+# — old repos still declare it via runtime.txt / setup.py python_requires.
+_PYTHON_CANDIDATES = [f"python3.{m}" for m in range(14, 5, -1)] + ["python2.7"]
 
 
 def _detect_python_requirement(workspace: str) -> Optional[str]:
@@ -1953,6 +1978,42 @@ async def _pyenv_install(requirement, spec) -> tuple[Optional[str], str]:
     return None, f"pyenv install {target} failed: {out[-300:]}"
 
 
+def _pyenv_installed_interpreters() -> dict[str, str]:
+    """
+    Concrete (non-shim) interpreter paths for every pyenv-installed version,
+    keyed by minor version ("3.11" -> .../versions/3.11.15/bin/python).
+    Shims on PATH resolve lazily based on pyenv's global/local version
+    config at *invocation* time, so `shutil.which("python3.11")` can return
+    a shim that fails with "command not found" even right after pyenv just
+    installed that exact version — the concrete versions/ path always works.
+    """
+    pyenv = _pyenv_bin()
+    if not pyenv:
+        return {}
+    versions_dir = os.path.join(os.path.dirname(os.path.dirname(pyenv)), "versions")
+    if not os.path.isdir(versions_dir):
+        return {}
+
+    from packaging.version import Version
+
+    best: dict[str, tuple] = {}
+    for entry in os.listdir(versions_dir):
+        py = os.path.join(versions_dir, entry, "bin", "python")
+        if not os.path.isfile(py):
+            continue
+        m = re.match(r"(\d+)\.(\d+)", entry)
+        if not m:
+            continue
+        minor = f"{m.group(1)}.{m.group(2)}"
+        try:
+            v = Version(entry)
+        except Exception:
+            continue
+        if minor not in best or v > best[minor][0]:
+            best[minor] = (v, py)
+    return {minor: path for minor, (_, path) in best.items()}
+
+
 async def _find_best_python(requirement: Optional[str]) -> tuple[str, str]:
     """
     Pick the interpreter to build the venv with.
@@ -1969,11 +2030,14 @@ async def _find_best_python(requirement: Optional[str]) -> tuple[str, str]:
     except Exception as e:
         return sys.executable, f"Couldn't parse Python requirement {requirement!r} ({e}) — using host default (Python {current})"
 
-    # Every python3.X on PATH, plus the interpreter already running us.
+    # Concrete pyenv installs first (always reliable), then every python3.X
+    # on PATH that ISN'T a pyenv shim (shims are fragile — see docstring
+    # above), plus the interpreter already running us.
     found: dict[str, str] = {current: sys.executable}
+    found.update(_pyenv_installed_interpreters())
     for name in _PYTHON_CANDIDATES:
         path = shutil.which(name)
-        if path:
+        if path and "/.pyenv/shims/" not in path:
             found.setdefault(name.removeprefix("python"), path)
 
     candidates = []
@@ -2009,6 +2073,54 @@ async def _find_best_python(requirement: Optional[str]) -> tuple[str, str]:
 #  Environment Setup
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _create_venv(python_exe: str, venv_path: str) -> tuple[bool, str]:
+    proc = await asyncio.create_subprocess_exec(
+        python_exe, "-m", "venv", venv_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        return False, "venv creation timed out"
+    return proc.returncode == 0, err.decode(errors="ignore")
+
+
+def _looks_like_missing_venv_module(err: str) -> bool:
+    return "No module named venv" in err or "No module named 'venv'" in err
+
+
+async def _create_venv_via_virtualenv(python_exe: str, venv_path: str) -> tuple[bool, str]:
+    """
+    Python 2 (and some minimal Python 3 installs) has no stdlib `venv`
+    module. Orchestrating `virtualenv` from OUR OWN (modern) interpreter via
+    `-p <target>` doesn't work for Python-2 targets — recent virtualenv
+    releases probe the target with a script that uses 3.6+ syntax
+    (variable annotations), which Python 2 can't even parse, so the probe
+    itself crashes. Instead we install virtualenv INTO the target
+    interpreter and let it build its own env, self-hosted: pip running
+    under that interpreter automatically resolves the newest release still
+    compatible with it (old for py2, current for py3), so no version needs
+    to be hardcoded here.
+    """
+    ok, out = await _run_cmd(
+        [python_exe, "-m", "pip", "install", "--quiet", "virtualenv"],
+        os.getcwd(), timeout=120)
+    if not ok:
+        return False, f"could not install virtualenv into target interpreter: {out[:300]}"
+
+    proc = await asyncio.create_subprocess_exec(
+        python_exe, "-m", "virtualenv", venv_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
+    except asyncio.TimeoutError:
+        return False, "virtualenv creation timed out"
+    return proc.returncode == 0, out_b.decode(errors="ignore")
+
+
 async def _setup_environment(
     workspace: str,
     venv_path: str,
@@ -2021,32 +2133,22 @@ async def _setup_environment(
     python_exe, python_msg = await _find_best_python(requirement)
     parts.append(f"ℹ {python_msg}")
 
-    proc = await asyncio.create_subprocess_exec(
-        python_exe, "-m", "venv", venv_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        _, err = await asyncio.wait_for(proc.communicate(), timeout=60)
-    except asyncio.TimeoutError:
-        return False, "venv creation timed out"
-    if proc.returncode != 0:
-        # The selected interpreter may be missing venv/ensurepip (common on
-        # minimal system installs) — retry once with the host default before
-        # giving up, so a version-selection choice can't fully block execution.
-        if python_exe != sys.executable:
-            parts.append(f"⚠ venv creation failed with {python_exe} ({err.decode(errors='ignore')[:200]}), retrying with host default")
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "venv", venv_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, err = await asyncio.wait_for(proc.communicate(), timeout=60)
-            except asyncio.TimeoutError:
-                return False, "venv creation timed out"
-        if proc.returncode != 0:
-            return False, f"venv creation failed: {err.decode(errors='ignore')[:300]}"
+    venv_ok, err = await _create_venv(python_exe, venv_path)
+
+    if not venv_ok and _looks_like_missing_venv_module(err):
+        parts.append(f"⚠ '{os.path.basename(python_exe)} -m venv' unavailable "
+                      f"({err[:150]}) — falling back to virtualenv")
+        venv_ok, err = await _create_venv_via_virtualenv(python_exe, venv_path)
+
+    if not venv_ok and python_exe != sys.executable:
+        # Last resort: the selected interpreter may be broken/missing
+        # entirely — retry with the host default before giving up, so a
+        # version-selection choice can't fully block execution.
+        parts.append(f"⚠ venv creation failed with {python_exe} ({err[:200]}), retrying with host default")
+        venv_ok, err = await _create_venv(sys.executable, venv_path)
+
+    if not venv_ok:
+        return False, f"venv creation failed: {err[:300]}"
     parts.append("✓ Virtual environment created")
 
     pip = _pip_path(venv_path)
@@ -2252,11 +2354,72 @@ def _inject_inputs(cmd: str, input_files: list[str]) -> str:
 #  Direct Command Runner
 # ─────────────────────────────────────────────────────────────────────────────
 
+_PORT_RE = re.compile(
+    r"--port[= ](\d{2,5})|"
+    r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})"
+)
+_DEFAULT_SERVER_PORTS = (8000, 5000, 8501, 7860, 8050, 8888, 3000)
+
+
+def _guess_ports(run_cmd: str, text: str) -> set[int]:
+    """Ports worth probing to confirm a server is actually listening —
+    from an explicit --port flag, from any host:port already seen in the
+    logs, plus the well-known defaults for common Python web frameworks."""
+    ports: set[int] = set()
+    for m in _PORT_RE.finditer(run_cmd + "\n" + text):
+        for g in m.groups():
+            if g:
+                try:
+                    ports.add(int(g))
+                except ValueError:
+                    pass
+    return ports or set(_DEFAULT_SERVER_PORTS)
+
+
+async def _probe_port(port: int, timeout: float = 0.3) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port), timeout=timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _kill_process_tree(proc: "asyncio.subprocess.Process") -> None:
+    """Kill the whole process group, not just the wrapper shell — server
+    frameworks (uvicorn workers, Django's autoreloader, etc.) fork children
+    that survive a plain proc.kill() on the parent."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
 async def _run_direct(
     run_cmd:   str,
     workspace: str,
     venv_path: str,
 ) -> tuple[int, str, str]:
+    """
+    Runs the command, streaming stdout/stderr while it's alive.
+
+    Servers (FastAPI/uvicorn, Django, Flask, Streamlit, Gradio, ...) never
+    exit with code 0 on their own — waiting on proc.communicate() would
+    block for the full SCRIPT_TIMEOUT on every attempt just to find that
+    out. Instead we watch the output (and probe likely ports) as it runs;
+    once a startup banner or an open port is seen and stays up for
+    SERVER_CONFIRM_GRACE seconds, we treat it as a confirmed success and
+    close it ourselves rather than waiting out the timeout.
+    """
     activate     = f'source "{venv_path}/bin/activate"' if venv_path else ""
     shell_script = (
         "#!/bin/bash\n"
@@ -2265,7 +2428,10 @@ async def _run_direct(
         "export PYTHONDONTWRITEBYTECODE=1\n"
         + (f'set +u\n{activate}\nset -u\n' if activate else "")
         + f'cd "{workspace}"\n'
-        + f"timeout {SCRIPT_TIMEOUT} bash -c {shlex.quote(run_cmd)}\n"
+        # --foreground keeps the monitored command in OUR process group instead
+        # of spawning its own — otherwise os.killpg() in _kill_process_tree()
+        # can't reach it and server processes (uvicorn, runserver, ...) leak.
+        + f"timeout --foreground {SCRIPT_TIMEOUT} bash -c {shlex.quote(run_cmd)}\n"
     )
     tmp = Path(workspace) / ".run_direct.sh"
     tmp.write_text(shell_script, encoding="utf-8")
@@ -2282,22 +2448,77 @@ async def _run_direct(
                 "HOME":        os.environ.get("HOME", "/tmp"),
                 "MPLBACKEND":  "Agg",   # render to file, never open a GUI window
             },
+            start_new_session=True,   # own process group so we can kill server workers too
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=SCRIPT_TIMEOUT + 10)
-        return (
-            proc.returncode,
-            stdout.decode(errors="ignore")[:6000],
-            stderr.decode(errors="ignore")[:6000],
-        )
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        return 1, "", f"Command timed out after {SCRIPT_TIMEOUT}s"
     except Exception as exc:
         return 1, "", str(exc)
+
+    stdout_buf = bytearray()
+    stderr_buf = bytearray()
+
+    async def _drain(stream, buf: bytearray) -> None:
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return
+            buf.extend(chunk)
+
+    stdout_task = asyncio.ensure_future(_drain(proc.stdout, stdout_buf))
+    stderr_task = asyncio.ensure_future(_drain(proc.stderr, stderr_buf))
+
+    server_since: Optional[float] = None
+    started_at   = time.monotonic()
+    confirmed_server = False
+
+    try:
+        while True:
+            if proc.returncode is not None:
+                break  # exited on its own
+
+            if time.monotonic() - started_at >= SCRIPT_TIMEOUT + 10:
+                break  # hard cap — matches the `timeout` wrapper + margin
+
+            combined = (bytes(stdout_buf) + bytes(stderr_buf)).decode(errors="ignore")
+            looks_like_server = bool(_UI_SERVER_STARTED.search(combined))
+            if not looks_like_server:
+                for port in _guess_ports(run_cmd, combined):
+                    if await _probe_port(port):
+                        looks_like_server = True
+                        break
+
+            if looks_like_server and server_since is None:
+                server_since = time.monotonic()
+            elif not looks_like_server:
+                server_since = None  # e.g. port probe was a fluke — reset and keep watching
+
+            if server_since is not None and time.monotonic() - server_since >= SERVER_CONFIRM_GRACE:
+                confirmed_server = True
+                break
+
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_RUN_POLL_INTERVAL)
+                break  # exited while we were polling
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        if proc.returncode is None:
+            _kill_process_tree(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            pass
+        for t in (stdout_task, stderr_task):
+            t.cancel()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+    stdout = bytes(stdout_buf).decode(errors="ignore")[:6000]
+    stderr = bytes(stderr_buf).decode(errors="ignore")[:6000]
+
+    if confirmed_server:
+        return 0, stdout, stderr
+    if proc.returncode is not None:
+        return proc.returncode, stdout, stderr
+    return 1, stdout, stderr + f"\nCommand timed out after {SCRIPT_TIMEOUT}s"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

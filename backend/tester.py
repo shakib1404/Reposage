@@ -12,12 +12,14 @@ Scanners (Python-only):
   types     — mypy (static type errors)
   secrets   — detect-secrets (leaked credentials / keys)
   deadcode  — vulture (unused functions / variables)
+  semgrep   — semgrep (cross-language structural pattern rules, registry "auto" config)
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -34,14 +36,20 @@ OUTPUT_ROOT   = os.getenv("EXECUTOR_OUTPUT_ROOT",
 CLONE_TIMEOUT = 120
 TOOL_TIMEOUT  = 120   # seconds per scanner run
 
-# Severity → score penalty
-WEIGHTS: dict[str, int] = {
-    "critical": 20,
-    "high":     10,
-    "medium":    5,
-    "low":       1,
-    "info":      0,
+# Per-finding severity weight, taken from the official CVSS v3.1 qualitative
+# severity rating scale (FIRST.org / NIST NVD): None 0.0, Low 0.1-3.9,
+# Medium 4.0-6.9, High 7.0-8.9, Critical 9.0-10.0. Each of our severities is
+# mapped to the midpoint of its CVSS band.
+CVSS_WEIGHTS: dict[str, float] = {
+    "critical": 9.5,
+    "high":     8.0,
+    "medium":   5.5,
+    "low":      2.0,
+    "info":     0.0,
 }
+
+# Decay constant for score_from_exposure(). Larger K = slower decay.
+SCORE_DECAY_K = 40.0
 
 SCANNER_META = [
     {"id": "lint",     "name": "Linting",           "icon": "🔍", "tool": "ruff"},
@@ -50,7 +58,47 @@ SCANNER_META = [
     {"id": "types",    "name": "Type Analysis",     "icon": "🔬", "tool": "mypy"},
     {"id": "secrets",  "name": "Secret Detection",  "icon": "🔑", "tool": "detect-secrets"},
     {"id": "deadcode", "name": "Dead Code",         "icon": "💀", "tool": "vulture"},
+    {"id": "semgrep",  "name": "Pattern Analysis",  "icon": "🧩", "tool": "semgrep"},
 ]
+
+# Longer budget than TOOL_TIMEOUT — semgrep's "auto" config fetches a
+# curated ruleset from the registry before it can scan, which is slower
+# than the other (purely local) scanners.
+SEMGREP_TIMEOUT = 240
+
+# Directories that hold a THIRD PARTY dependency tree, sometimes committed
+# into the repo by accident (a Replit-generated venv/, a vendored
+# node_modules/, a stale .tox/ from CI). If any of these exist inside the
+# cloned repo itself, every scanner finding inside them is a finding about
+# someone else's package, not the audited repo's own code — one real
+# instance of this reproduced a 0/F, 720-finding report for a 16-line
+# FizzBuzz script, entirely from bandit/semgrep flagging code inside a
+# committed `venv/`. Stripped from the workspace right after clone, before
+# any scanner runs, so this bug class is structurally impossible regardless
+# of which of the 7 tools would otherwise have walked into it.
+VENDOR_DIR_NAMES = {
+    "venv", ".venv", "env", "virtualenv", "ENV",
+    "node_modules", ".tox", "site-packages",
+    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+}
+
+
+def _strip_vendor_dirs(workspace: str) -> list[str]:
+    """Remove committed dependency/vendor directories from a freshly cloned
+    workspace before any scanner touches it. Returns the relative paths
+    removed (surfaced in the SSE log so this isn't a silent behavior change)."""
+    removed: list[str] = []
+    for root, dirnames, _ in os.walk(workspace, topdown=True):
+        keep = []
+        for d in dirnames:
+            if d in VENDOR_DIR_NAMES:
+                full = os.path.join(root, d)
+                shutil.rmtree(full, ignore_errors=True)
+                removed.append(os.path.relpath(full, workspace))
+            else:
+                keep.append(d)
+        dirnames[:] = keep   # don't descend into dirs we just deleted
+    return removed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,10 +125,25 @@ async def run_test_loop(
         workspace = await _clone(repo_full_name)
         yield _ev("status", "Repository cloned", f"✓ {repo_full_name}")
 
+        vendor_removed = _strip_vendor_dirs(workspace)
+        if vendor_removed:
+            yield _ev("status", "Excluded vendored dependencies",
+                      f"Removed from scan scope (not part of the repo's own "
+                      f"code): {', '.join(vendor_removed[:10])}")
+
         # ── 2. Create isolated venv ───────────────────────────────────────────
+        # Deliberately created OUTSIDE the cloned workspace (as a sibling temp
+        # dir), not as a ".audit_venv" subdirectory of it. Scanners like
+        # detect-secrets and vulture have no smart default excludes the way
+        # ruff/bandit/semgrep do, so a venv nested inside the workspace gets
+        # recursively scanned along with the repo — every finding inside its
+        # site-packages (the scanners' *own* installed dependencies) then gets
+        # reported as if it were a finding in the audited repo, silently
+        # wrecking the score. Keeping the venv outside the tree scanners walk
+        # makes that whole bug class structurally impossible.
         yield _ev("status", "Setting up audit environment",
                   "Creating isolated virtual environment…")
-        venv_path = os.path.join(workspace, ".audit_venv")
+        venv_path = tempfile.mkdtemp(prefix="audit_venv_")
         venv_ok, venv_msg = await _create_venv(venv_path)
         if not venv_ok:
             yield _ev("warning", "Venv warning", venv_msg)
@@ -102,6 +165,15 @@ async def run_test_loop(
             yield _ev("scanner_start", meta["name"],
                       f"Installing & running {meta['tool']}…",
                       scanner=sid, icon=meta["icon"])
+
+            # Re-strip before EVERY scanner, not just once after clone: mypy
+            # writes .mypy_cache into the workspace as a side effect of the
+            # types scan, and without this a later scanner (secrets/deadcode)
+            # picks that cache dir up as if it were repo content — the exact
+            # same false-positive-flood bug, just self-inflicted by our own
+            # pipeline instead of committed by the repo author. Cheap no-op
+            # when nothing new appeared.
+            _strip_vendor_dirs(workspace)
 
             try:
                 findings = await _run_scanner(sid, workspace, venv_path)
@@ -160,6 +232,8 @@ async def run_test_loop(
     finally:
         if workspace and os.path.isdir(workspace):
             shutil.rmtree(workspace, ignore_errors=True)
+        if venv_path and os.path.isdir(venv_path):
+            shutil.rmtree(venv_path, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +249,7 @@ async def _run_scanner(scanner_id: str,
         "types":    _scan_types,
         "secrets":  _scan_secrets,
         "deadcode": _scan_deadcode,
+        "semgrep":  _scan_semgrep,
     }
     fn = dispatch.get(scanner_id)
     return await fn(workspace, venv_path) if fn else []
@@ -365,6 +440,44 @@ async def _scan_deadcode(workspace: str, venv_path: str) -> list[dict]:
     return findings[:300]
 
 
+# ── semgrep ──────────────────────────────────────────────────────────────────
+
+async def _scan_semgrep(workspace: str, venv_path: str) -> list[dict]:
+    pip = _pip(venv_path)
+    await _run([pip, "install", "semgrep", "--quiet"], workspace, timeout=120)
+    semgrep = _tool(venv_path, "semgrep")
+    # NOTE: --config auto requires metrics to stay on — Semgrep uses that
+    # ping to pick the curated ruleset for the repo; passing --metrics=off
+    # (or SEMGREP_SEND_METRICS=off) makes "auto" fail outright.
+    ok, out = await _run(
+        [semgrep, "--config", "auto", "--json", "--quiet",
+         "--disable-version-check", "."],
+        workspace, timeout=SEMGREP_TIMEOUT)
+    findings = []
+    sev_map = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
+    try:
+        data = json.loads(out)
+        for item in data.get("results", []):
+            extra    = item.get("extra") or {}
+            sev_raw  = (extra.get("severity") or "INFO").upper()
+            conf_raw = ((extra.get("metadata") or {}).get("confidence") or "").upper()
+            # Mirror the bandit escalation rule: only the strongest signal
+            # (rule author says ERROR *and* HIGH confidence) counts as critical.
+            sev = "critical" if (sev_raw == "ERROR" and conf_raw == "HIGH") \
+                  else sev_map.get(sev_raw, "low")
+            findings.append(_finding(
+                scanner="semgrep", severity=sev,
+                file=_rel(item.get("path", ""), workspace),
+                line=(item.get("start") or {}).get("line", 0),
+                rule=(item.get("check_id") or "").split(".")[-1],
+                message=extra.get("message", ""),
+                confidence=conf_raw,
+            ))
+    except Exception:
+        pass
+    return findings[:500]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,8 +505,21 @@ def _count_severities(findings: list[dict]) -> dict[str, int]:
 
 
 def _compute_score(sev_counts: dict[str, int]) -> tuple[int, str]:
-    penalty = sum(WEIGHTS[k] * v for k, v in sev_counts.items())
-    score = max(0, 100 - penalty)
+    """
+    Aggregate CVSS-weighted exposure, converted to a 0-100 score via
+    exponential decay: score = 100 * e^(-exposure / K).
+
+    A plain linear subtraction (the previous approach) has two flaws: it
+    clips at 0 as soon as the penalty passes 100 (e.g. 5 criticals or 100
+    low-severity findings both bottom out identically, losing all signal
+    about how much worse one repo is than another beyond that point), and
+    it treats each finding as equally significant regardless of how many
+    others already fired. Exponential decay avoids both — every finding
+    still lowers the score, but with diminishing marginal impact, so the
+    score keeps distinguishing "bad" from "much worse" instead of flatlining.
+    """
+    exposure = sum(CVSS_WEIGHTS[k] * v for k, v in sev_counts.items())
+    score = round(100 * math.exp(-exposure / SCORE_DECAY_K))
     grade = ("A" if score >= 90 else
              "B" if score >= 75 else
              "C" if score >= 60 else

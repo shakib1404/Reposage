@@ -30,6 +30,7 @@ from chat import answer_question
 from rag import build_index, index_info
 from executor import run_execution_loop, OUTPUT_ROOT, CREDENTIAL_STORE, CREDENTIAL_EVENTS
 from tester import run_test_loop
+from autofix import run_autofix_loop
 from copydetector.detector import VenDetector, Detection, Source, Status
 from copydetector.repo import Repository, File as RepoFile
 from copydetector.errors import VendetectError, VendetectRuntimeError
@@ -74,7 +75,17 @@ async def warm_db():
         except Exception:
             pass
 
-    await _asyncio.gather(_warm_bcrypt(), _warm_mongo())
+    # 3. Warm the search reranker — loading the cross-encoder takes ~9s, and
+    #    paying that inside the first user's search made it feel broken.
+    #    Runs in a thread so it never blocks startup or the event loop.
+    async def _warm_reranker():
+        try:
+            from search import warm_models
+            await _asyncio.to_thread(warm_models)
+        except Exception:
+            pass
+
+    await _asyncio.gather(_warm_bcrypt(), _warm_mongo(), _warm_reranker())
 
 
 app.add_middleware(
@@ -225,7 +236,8 @@ async def delete_history_entry(history_id: str, user: dict = Depends(get_current
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SearchRequest(BaseModel):
-    task: str
+    task:  str
+    limit: int = 9
 
 class SelectRequest(BaseModel):
     task:             str
@@ -240,6 +252,10 @@ class ExecuteRequest(BaseModel):
     input_files:   list[str] = []
 
 class TestRequest(BaseModel):
+    repo_full_name: str
+    job_id:         str = ""
+
+class AutofixRequest(BaseModel):
     repo_full_name: str
     job_id:         str = ""
 
@@ -307,8 +323,8 @@ async def upload_files(
 async def search(req: SearchRequest,
                  user: Optional[dict] = Depends(get_optional_user)):
     try:
-        repos = await search_repos(req.task)
-        return {"repos": repos}
+        # search_repos returns {"repos": [...], "suggestions": [...], "query": ...}
+        return await search_repos(req.task, limit=req.limit)
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -737,6 +753,24 @@ async def test_repo(req: TestRequest,
 
     async def event_stream() -> AsyncGenerator[str, None]:
         async for event in run_test_loop(req.repo_full_name, job_id=job_id):
+            yield f"data: {json.dumps(event)}\n\n"
+            await asyncio.sleep(0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Semgrep autofix → pull request (SSE) ─────────────────────────────────────
+@app.post("/api/autofix")
+async def autofix_repo(req: AutofixRequest,
+                       user: Optional[dict] = Depends(get_optional_user)):
+    job_id = req.job_id or ""
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        async for event in run_autofix_loop(req.repo_full_name, job_id=job_id):
             yield f"data: {json.dumps(event)}\n\n"
             await asyncio.sleep(0)
 

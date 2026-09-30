@@ -12,7 +12,7 @@ const EXAMPLES = [
 
 const ACCEPT = '.png,.jpg,.jpeg,.gif,.bmp,.webp,.csv,.json,.pdf,.txt,.mp4,.wav,.mp3'
 
-export default function SearchPage({ task, setTask, setRepos, setJobId, setInputFiles, unlock, go }) {
+export default function SearchPage({ task, setTask, setRepos, setSuggestions, setJobId, setInputFiles, unlock, go }) {
   const [loading, setLoading] = useState(false)
   const [logs, setLogs] = useState([])
   const [progress, setProgress] = useState(0)
@@ -79,11 +79,15 @@ export default function SearchPage({ task, setTask, setRepos, setJobId, setInput
       setProgress(45)
       const data = await searchRepos(t)
       setProgress(75)
-      addLog(`Ranking ${data.repos.length} candidates…`, 'info')
+      if (data.query && data.query !== t.toLowerCase()) {
+        addLog(`Interpreted as "${data.query}"`, 'info')
+      }
+      addLog(`Ranking candidates by relevance, popularity & runnability…`, 'info')
       setProgress(90)
-      addLog(`Top 3 repos selected ✓`, 'ok')
+      addLog(`Top ${data.repos.length} repos selected ✓`, 'ok')
       setProgress(100)
       setRepos(data.repos)
+      setSuggestions?.(data.suggestions || [])
       unlock('select')
       setTimeout(() => go('select'), 500)
     } catch (e) {

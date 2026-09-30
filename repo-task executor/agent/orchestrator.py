@@ -110,6 +110,19 @@ class AgentOrchestrator:
                 return result
 
             # ── Step 4: Commit & Push PR ──────────────────────────────
+            # Some tasks are purely informational (e.g. "list the files in
+            # this repo") and correctly produce zero file changes. Pushing
+            # in that case would run `git commit` with nothing staged, which
+            # always fails — that's not a real failure, it's an expected
+            # no-op outcome, so skip the push/PR step entirely instead of
+            # letting it blow up into a reported task failure.
+            if not changes.all_changed_paths():
+                log.info("No file changes were needed — nothing to commit or push.")
+                result.success = True
+                log.section(f"DONE — no changes needed for: {task[:60]}")
+                result.duration_seconds = time.monotonic() - start
+                return result
+
             log.step(4, "Pushing to GitHub")
             pr_agent = GitHubPRAgent(self.workspace_dir, github_url)
             branch = pr_agent.commit_and_push(

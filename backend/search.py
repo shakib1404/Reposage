@@ -21,7 +21,9 @@ Key design decisions:
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import logging
+import math
 import os
 import re
 
@@ -40,9 +42,49 @@ USE_MOCK   = os.getenv("USE_MOCK", "false").lower() == "true"
 # can return ~19 raw items (4 sub-queries) and is listed first in merge
 # priority, so a cap of 15 was silently dropping every Jina/Serper-only
 # candidate that GitHub didn't also find — including highly-starred, clearly
-# relevant repos. 30 comfortably covers realistic merged totals (~26 in
-# testing) without letting a pathological query balloon API/rerank cost.
-MAX_CANDIDATES = 30
+# relevant repos. Raised from 30 → 80 now that the UI shows 9 results instead
+# of 3: picking the best 9 needs a materially deeper pool than picking 3, and
+# the expensive per-candidate work (the runnability probe) no longer runs over
+# the whole pool — only over the PROBE_TOP_N survivors of the cheap prerank.
+MAX_CANDIDATES = 80
+
+# How many results the UI shows.
+RESULT_LIMIT = 9
+
+# Only this many top-preranked candidates get the extra GitHub Contents API
+# call that powers the runnability signal. Classic cascade: cheap scoring over
+# everything, expensive scoring over the shortlist only. Set comfortably above
+# RESULT_LIMIT so runnability can still reorder the final page meaningfully.
+PROBE_TOP_N = 24
+
+# Final blend. Relevance still dominates — a perfectly maintained repo that
+# does the wrong thing is useless — but popularity alone no longer decides
+# the tail, and runnability is now a first-class signal because RepoSage's
+# whole point is EXECUTING the selected repo, not just reading it.
+W_SEMANTIC    = 0.40
+W_POPULARITY  = 0.32
+W_RUNNABILITY = 0.28
+
+# Cross-encoder scores are min-max normalized across the candidate set, so the
+# best candidate always scores 10 no matter how bad it is in absolute terms.
+# That's fine for ordering, but it means a hugely popular yet only-vaguely
+# related repo can ride its star weight into the top 9. Anything scoring below
+# this on relevance is treated as noise and dropped regardless of popularity.
+MIN_SEMANTIC = 4.0
+
+# Files whose presence at the repo root means "someone wrote down how to
+# install this", which is by far the strongest cheap predictor of whether an
+# automated clone-and-run will succeed.
+DEP_FILES = {
+    "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
+    "environment.yml", "environment.yaml", "pipfile", "poetry.lock",
+    "requirements-dev.txt", "conda.yaml",
+}
+# A plausible "just run this" entry point.
+ENTRY_FILES = {
+    "main.py", "app.py", "run.py", "cli.py", "manage.py",
+    "server.py", "demo.py", "__main__.py",
+}
 
 # Authenticated GitHub API requests get 5000 req/hr instead of 60 — without
 # this, a single search (multiple GitHub Search API queries + up to
@@ -63,9 +105,16 @@ def _github_headers() -> dict:
 #  Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def search_repos(task: str) -> list[dict]:
+async def search_repos(task: str, limit: int = RESULT_LIMIT) -> dict:
+    """
+    Returns {"repos": [...], "suggestions": [...], "query": "<canonical>"}.
+
+    (Historically this returned a bare list of 3 repos. It now returns the
+    richer envelope so the UI can render the "refine your search" chips and
+    show what the raw task was actually normalized to.)
+    """
     if USE_MOCK:
-        return _mock_repos(task)
+        return {"repos": _mock_repos(task), "suggestions": [], "query": task}
 
     # Normalize the raw task into a canonical technical phrase FIRST.
     # Two differently-worded requests for the same underlying task
@@ -102,28 +151,52 @@ async def search_repos(task: str) -> list[dict]:
     # Merge, deduplicate, keep insertion order.
     # GitHub API (exact name/description match) first, then Jina's semantic
     # read of the raw task, then the two Serper queries.
+    # Dedup is case-INSENSITIVE: GitHub treats owner/repo case-insensitively
+    # and the sources disagree on casing (Serper echoes whatever the page
+    # linked, the API returns canonical casing), so "cjhutto/vaderSentiment"
+    # and "cjhutto/vadersentiment" were surviving as two separate candidates
+    # and could both render as cards in the results.
     seen: set[str] = set()
     raw_repos: list[dict] = []
     for r in raw3 + raw4 + raw1 + raw2:
-        if r["full_name"] not in seen:
-            seen.add(r["full_name"])
+        key = r["full_name"].lower()
+        if key not in seen:
+            seen.add(key)
             raw_repos.append(r)
+
+    # The "refine your search" chips are independent of retrieval, so kick the
+    # LLM call off now and collect it at the end — it overlaps with the
+    # enrichment/probe round trips instead of adding to total latency.
+    suggest_task = asyncio.create_task(_refine_suggestions(task, query))
 
     if not raw_repos:
         # All 3 live search APIs came back empty/failed — last resort is to
         # ask the LLM to recall known repos from training knowledge, still
         # keyed off the actual task (not a hardcoded topic-bucket guess).
-        return await _llm_recall_repos(task)
+        return {
+            "repos":       await _llm_recall_repos(task),
+            "suggestions": await suggest_task,
+            "query":       query,
+        }
 
-    # Fetch real star counts + topics for all candidates
-    raw_repos = await _enrich_with_stars(raw_repos)
+    # Fetch real stars/forks/topics/avatars/push-dates for all candidates
+    raw_repos = await _enrich_metadata(raw_repos)
+
+    # Drop anything that cannot plausibly be the answer before spending
+    # cross-encoder time or Contents API calls on it.
+    raw_repos = [r for r in raw_repos if not _is_disqualified(r)]
 
     # Rank against the NORMALIZED query, not the raw task — retrieval already
     # used `query`, so ranking on the same text guarantees two differently
     # -worded requests for the same intent get identical results end-to-end,
     # instead of embedding similarity re-introducing phrasing sensitivity.
     ranked = await _rank_repos(raw_repos, query)
-    return ranked[:3]
+
+    return {
+        "repos":       ranked[:limit],
+        "suggestions": await suggest_task,
+        "query":       query,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,12 +231,24 @@ _NORMALIZE_SYSTEM = (
 async def _normalize_query(task: str) -> str:
     """Collapse any phrasing of the same intent to one canonical search phrase."""
     try:
+        # max_tokens must stay generous even though the ANSWER is 2-6 words:
+        # the configured Groq model (openai/gpt-oss-120b) is a reasoning model
+        # that spends tokens on internal reasoning before emitting content, so
+        # a tight budget returns an EMPTY string rather than a short answer.
+        # At the old value of 20 this silently returned "" on every call and
+        # fell through to `or task` — normalization looked wired up but had
+        # been dead since the model migration, making retrieval phrasing-
+        # sensitive again. Measured: 20 -> "", 60+ -> "sentiment analysis".
         result = await llm_chat(
             system=_NORMALIZE_SYSTEM, user=task,
-            max_tokens=20, temperature=0.0,
+            max_tokens=300, temperature=0.0,
         )
         cleaned = result.strip().strip('"').strip(".").lower()
-        return cleaned or task
+        # A reasoning model that overruns its budget can also emit a partial
+        # sentence; anything long is not a canonical phrase, so ignore it.
+        if not cleaned or len(cleaned.split()) > 8:
+            return task
+        return cleaned
     except Exception as e:
         log.warning("Query normalization failed, using raw task: %s", e)
         return task
@@ -283,78 +368,262 @@ async def _github_search(query: str) -> list[dict]:
     """
     tokens = re.findall(r"[a-zA-Z0-9]+", query.lower())
     hyphen_name = "-".join(tokens)   # e.g. "json-to-pdf-conversion"
-    queries = [
-        f'"{query}" language:python',
-        f'{query} language:python',
-        f'{" ".join(tokens)} in:name,description language:python',
-        f'{hyphen_name} in:name',   # catches exact hyphenated repo names
+
+    # Each entry is (query, params). Two distinct jobs are being done here:
+    #  • the `sort=stars` variants pull the well-known heavyweights that a
+    #    user would be annoyed NOT to see (TextBlob, vaderSentiment, ...) —
+    #    these are what "the best ones" usually means in practice;
+    #  • the relevance-sorted `in:name`/`in:topics` variants pull small,
+    #    exact-match repos that stars would otherwise bury forever.
+    # Filling 9 slots well needs both, so both are queried explicitly rather
+    # than hoping one ordering happens to surface the other's winners.
+    plain = " ".join(tokens)
+    queries: list[tuple[str, dict]] = [
+        (f'{query} language:python',
+         {"sort": "stars", "order": "desc", "per_page": 20}),
+        (f'"{query}" language:python',
+         {"sort": "stars", "order": "desc", "per_page": 15}),
+        (f'{plain} in:name,description language:python',
+         {"per_page": 20}),
+        (f'{hyphen_name} in:name',
+         {"per_page": 15}),
+        (f'{plain} in:readme language:python stars:>50',
+         {"sort": "stars", "order": "desc", "per_page": 10}),
+        (f'topic:{hyphen_name}',
+         {"sort": "stars", "order": "desc", "per_page": 10}),
     ]
+
     repos: list[dict] = []
     seen:  set[str]   = set()
     headers = _github_headers()
-    async with httpx.AsyncClient(timeout=10) as client:
-        for q in queries:
-            try:
-                # Name searches: sort by relevance (not stars) to surface
-                # small exact-match repos; other queries sort by stars
-                if "in:name" in q:
-                    params = {"q": q, "per_page": 15}
-                else:
-                    params = {"q": q, "sort": "stars", "order": "desc", "per_page": 5}
+
+    async def run_one(q: str, params: dict) -> list[dict]:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
                     "https://api.github.com/search/repositories",
-                    params=params,
+                    params={"q": q, **params},
                     headers=headers,
                 )
-                if resp.status_code != 200:
-                    continue
-                for item in resp.json().get("items", []):
-                    fn = item.get("full_name", "")
-                    if fn and fn not in seen:
-                        seen.add(fn)
-                        repos.append({
-                            "full_name":   fn,
-                            "name":        item.get("name", ""),
-                            "owner":       item.get("owner", {}).get("login", ""),
-                            "snippet":     item.get("description") or "",
-                            "title":       item.get("name", ""),
-                            "stars_int":   item.get("stargazers_count", 0),
-                            "language":    item.get("language") or "Python",
-                            "topics":      item.get("topics") or [],
-                        })
-            except Exception:
+            if resp.status_code != 200:
+                return []
+            return resp.json().get("items", [])
+        except Exception:
+            return []
+
+    # Fire all query variants concurrently — they were previously sequential,
+    # which made GitHub the slowest of the four sources by a wide margin.
+    batches = await asyncio.gather(*[run_one(q, p) for q, p in queries])
+
+    for items in batches:
+        for item in items:
+            fn = item.get("full_name", "")
+            if not fn or fn in seen:
                 continue
+            seen.add(fn)
+            repos.append(_from_github_item(item))
     return repos
 
 
-async def _enrich_with_stars(repos: list[dict]) -> list[dict]:
+def _from_github_item(item: dict) -> dict:
+    """Normalize a GitHub API repo object into our internal candidate dict."""
+    owner = item.get("owner") or {}
+    return {
+        "full_name":  item.get("full_name", ""),
+        "name":       item.get("name", ""),
+        "owner":      owner.get("login", ""),
+        "avatar":     owner.get("avatar_url", ""),
+        "snippet":    item.get("description") or "",
+        "title":      item.get("name", ""),
+        "stars_int":  item.get("stargazers_count", 0),
+        "forks_int":  item.get("forks_count", 0),
+        "language":   item.get("language") or "",
+        "topics":     item.get("topics") or [],
+        "pushed_at":  item.get("pushed_at") or "",
+        "archived":   bool(item.get("archived")),
+        "is_fork":    bool(item.get("fork")),
+        "size_kb":    item.get("size", 0),
+        "has_issues": bool(item.get("has_issues")),
+    }
+
+
+async def _enrich_metadata(repos: list[dict]) -> list[dict]:
     """
-    Fetch real star counts from GitHub API for repos that don't already have one.
-    Runs all requests concurrently (max MAX_CANDIDATES repos).
+    Fill in full repo metadata (stars, forks, avatar, push date, archived flag,
+    language, topics) for candidates that came from Serper/Jina — those arrive
+    as nothing but a URL and a search snippet. Candidates that came from the
+    GitHub Search API already carry everything and are passed through untouched.
+
+    Runs concurrently, capped at MAX_CANDIDATES.
     """
     headers = _github_headers()
+
     async def fetch_one(repo: dict) -> dict:
-        if repo.get("stars_int") is not None:
-            return repo          # already have stars from GitHub search
+        if repo.get("stars_int") is not None and repo.get("pushed_at"):
+            return repo          # already fully populated by GitHub search
         try:
             async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.get(
                     f"https://api.github.com/repos/{repo['full_name']}",
                     headers=headers,
                 )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    repo["stars_int"]  = data.get("stargazers_count", 0)
-                    repo["language"]   = data.get("language") or repo.get("language", "Python")
-                    repo["topics"]     = data.get("topics") or []
-                    if not repo.get("snippet"):
-                        repo["snippet"] = data.get("description") or ""
+            if resp.status_code == 200:
+                merged = _from_github_item(resp.json())
+                # Keep the search snippet if the repo has no description of
+                # its own — it's the only text we'd otherwise have to rank on.
+                if not merged["snippet"]:
+                    merged["snippet"] = repo.get("snippet", "")
+                return merged
+            # 404/451 (deleted, renamed, DMCA'd) — mark it so it gets dropped.
+            repo["_dead"] = True
         except Exception:
             pass
         return repo
 
     enriched = await asyncio.gather(*[fetch_one(r) for r in repos[:MAX_CANDIDATES]])
-    return list(enriched)
+
+    # Dedup AGAIN after enrichment: the API canonicalizes names and silently
+    # follows renames, so two candidates that looked distinct pre-enrichment
+    # can resolve to the same repo.
+    seen: set[str] = set()
+    out: list[dict] = []
+    for r in enriched:
+        if r.get("_dead"):
+            continue
+        key = r["full_name"].lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def _is_disqualified(repo: dict) -> bool:
+    """
+    Hard filters — things that are never the right answer for "clone this and
+    run it", no matter how well they match the query text.
+    """
+    lang   = (repo.get("language") or "").lower()
+    topics = {t.lower() for t in (repo.get("topics") or [])}
+    name   = (repo.get("name") or "").lower()
+
+    if repo.get("archived"):
+        return True
+    # Non-Python repos are excluded outright: RepoSage's executor is a Python
+    # runner, so a JS/Go/Rust repo cannot be executed downstream even when it
+    # is the single most relevant result. Empty language is allowed through —
+    # GitHub reports null for small/new repos that are often still Python, and
+    # the runnability probe will confirm or deny it from the actual file list.
+    if lang and lang not in ("python", "jupyter notebook"):
+        return True
+    # Awesome-lists / curated link collections match sentiment-analysis-style
+    # queries extremely well on text and are completely unrunnable.
+    if name.startswith("awesome") or "awesome-list" in topics:
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Runnability — "can RepoSage actually clone this and execute it?"
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Relevance and stars say nothing about whether a repo will survive an
+# automated clone-install-run. The single cheapest high-signal proxy is the
+# root file listing: one Contents API call tells us whether dependencies are
+# declared, whether there's an obvious entry point, and whether the repo is
+# really just a pile of notebooks. This runs only over the PROBE_TOP_N
+# shortlist, so the extra API cost stays bounded regardless of pool size.
+
+async def _probe_runnability(repos: list[dict]) -> None:
+    """Annotate each repo in-place with `_run_score` (0-10) and `_run_tags`."""
+    headers = _github_headers()
+
+    async def probe(repo: dict) -> None:
+        names: list[str] = []
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    f"https://api.github.com/repos/{repo['full_name']}/contents/",
+                    headers=headers,
+                )
+            if resp.status_code == 200:
+                payload = resp.json()
+                if isinstance(payload, list):
+                    names = [(e.get("name") or "").lower() for e in payload]
+        except Exception:
+            pass
+        repo["_run_score"], repo["_run_tags"] = _score_runnability(repo, names)
+
+    await asyncio.gather(*[probe(r) for r in repos])
+
+
+def _score_runnability(repo: dict, root_files: list[str]) -> tuple[float, list[str]]:
+    """
+    0-10 runnability estimate from the root file listing plus repo metadata.
+    Returns (score, human-readable tags shown in the UI).
+    """
+    score = 4.0                       # neutral prior when we learn nothing
+    tags: list[str] = []
+    files = set(root_files)
+
+    # ── Dependencies declared ────────────────────────────────────────────
+    dep_hit = files & DEP_FILES
+    if dep_hit:
+        score += 2.5
+        tags.append("deps")
+    elif root_files:
+        # We successfully listed the root and there is genuinely no manifest —
+        # an automated install has nothing to go on.
+        score -= 1.5
+
+    # ── An obvious way to start it ───────────────────────────────────────
+    if files & ENTRY_FILES:
+        score += 1.5
+        tags.append("entrypoint")
+    if "dockerfile" in files:
+        score += 0.5
+        tags.append("docker")
+
+    # ── Notebook-only repos ──────────────────────────────────────────────
+    # These match ML/NLP queries beautifully and are miserable to run
+    # headlessly: no entry point, cells assume a human, paths assume Colab.
+    if (repo.get("language") or "").lower() == "jupyter notebook" and not dep_hit:
+        score -= 2.0
+        tags.append("notebook-only")
+
+    # ── Documented ───────────────────────────────────────────────────────
+    if any(f.startswith("readme") for f in files):
+        score += 0.5
+    else:
+        score -= 0.5
+
+    # ── Maintenance recency ──────────────────────────────────────────────
+    days = _days_since_push(repo.get("pushed_at", ""))
+    if days is not None:
+        if   days <= 365:  score += 1.5; tags.append("active")
+        elif days <= 730:  score += 0.5
+        elif days >= 1825: score -= 1.5; tags.append("stale")   # 5y+ untouched
+        elif days >= 1095: score -= 0.75
+
+    # ── Forks of someone else's work ─────────────────────────────────────
+    # Usually a student copy: same content, none of the maintenance.
+    if repo.get("is_fork"):
+        score -= 1.0
+
+    # ── Empty / placeholder repos ────────────────────────────────────────
+    if repo.get("size_kb", 0) < 20:
+        score -= 1.5
+
+    return max(0.0, min(10.0, score)), tags
+
+
+def _days_since_push(pushed_at: str) -> float | None:
+    if not pushed_at:
+        return None
+    try:
+        dt = _dt.datetime.fromisoformat(pushed_at.replace("Z", "+00:00"))
+        return (_dt.datetime.now(_dt.timezone.utc) - dt).days
+    except Exception:
+        return None
 
 
 def _fmt_stars(n: int) -> str:
@@ -446,43 +715,71 @@ def _get_reranker():
 
 
 def _repo_text(r: dict) -> str:
-    return (
-        f"{r.get('name', '')}: {r.get('snippet', '')} "
-        f"[{', '.join(r.get('topics') or [])}]"
-    )
+    """
+    Text the cross-encoder judges the query against.
+
+    Description leads, name trails. Leading with the name made the reranker
+    reward literal name matches above everything else — and "Sentiment-Analysis"
+    is exactly what every tutorial/student project is called, while the actually
+    canonical libraries have distinctive brand names (TextBlob, vaderSentiment,
+    spaCy) that match the query text poorly. Description-first measured
+    substantially better: it moved TextBlob and vaderSentiment into the top
+    results and pushed the 0-star name-twins out.
+    """
+    desc   = (r.get("snippet") or "").strip()
+    topics = ", ".join(r.get("topics") or [])
+    name   = r.get("name", "")
+    if not desc:
+        return f"{name} {topics}".strip()
+    return f"{desc} {topics} ({name})".strip()
 
 
 def _to_result(r: dict, sem_score: float) -> dict:
     stars_int = r.get("stars_int", 0)
-    combined  = round(sem_score * 0.6 + _star_weight(stars_int) * 0.4, 2)
+    star_w    = _star_weight(stars_int)
+    run_score = r.get("_run_score", 4.0)
+    combined  = round(
+        sem_score * W_SEMANTIC
+        + star_w * W_POPULARITY
+        + run_score * W_RUNNABILITY,
+        2,
+    )
     return {
         "full_name":    r["full_name"],
         "name":         r["name"],
         "owner":        r["owner"],
+        "avatar":       r.get("avatar") or
+                        f"https://github.com/{r.get('owner','')}.png?size=80",
         "stars":        _fmt_stars(stars_int),
-        "language":     r.get("language", "Python"),
-        "description":  r.get("snippet", "")[:150],
+        "stars_int":    stars_int,
+        "forks":        _fmt_stars(r.get("forks_int", 0)),
+        "forks_int":    r.get("forks_int", 0),
+        "language":     r.get("language") or "Python",
+        "topics":       (r.get("topics") or [])[:4],
+        "description":  (r.get("snippet") or "")[:180],
         "icon":         "📦",
         "score":        combined,
+        "runnable":     round(run_score, 1),
+        "run_tags":     r.get("_run_tags", []),
+        "pushed_at":    r.get("pushed_at", ""),
         "_sem_score":   round(sem_score, 2),
-        "_star_weight": round(_star_weight(stars_int), 2),
+        "_star_weight": round(star_w, 2),
     }
 
 
-def _embed_rank(repos: list[dict], task: str) -> list[dict]:
-    # ── Stage 1: bi-encoder scores — fallback only if reranking fails ───
-    model     = _get_embedder()
-    texts     = [_repo_text(r) for r in repos]
-    task_emb  = model.encode(task, normalize_embeddings=True)
-    repo_embs = model.encode(texts, normalize_embeddings=True)
+def _embed_rank(repos: list[dict], task: str) -> list[tuple[dict, float]]:
+    """
+    Score every candidate for relevance to `task`, returning (repo, 0-10) pairs.
 
-    scored = []
-    for r, emb in zip(repos, repo_embs):
-        cos_sim   = float(task_emb @ emb)        # normalized → dot == cosine
-        sem_score = max(0.0, min(10.0, cos_sim * 10))
-        scored.append((r, sem_score))
+    The cross-encoder runs FIRST and the bi-encoder is only touched if it
+    fails. Previously the bi-encoder pass always ran and was then thrown away
+    whenever reranking succeeded (i.e. essentially always) — pure waste, and
+    expensive waste: loading the bi-encoder costs ~11s of cold start and ~0.9s
+    of encoding per search, for a score that never reached the output.
+    """
+    texts = [_repo_text(r) for r in repos]
 
-    # ── Stage 2: cross-encoder reranks every candidate ───────────────────
+    # ── Preferred: cross-encoder scores each (query, repo) pair jointly ──
     # Raw logits from ms-marco-MiniLM run well past +5/-5 for anything
     # clearly relevant/irrelevant, so a sigmoid squash would saturate most
     # of them to ~10 and destroy differentiation. Min-max normalize across
@@ -490,42 +787,113 @@ def _embed_rank(repos: list[dict], task: str) -> list[dict]:
     # a globally calibrated scale.
     try:
         reranker = _get_reranker()
-        pairs    = [(task, _repo_text(r)) for r, _ in scored]
-        logits   = [float(x) for x in reranker.predict(pairs)]
+        logits   = [float(x) for x in reranker.predict([(task, t) for t in texts])]
         lo, hi   = min(logits), max(logits)
         spread   = hi - lo
-        scored = [
+        return [
             (r, ((logit - lo) / spread * 10) if spread > 1e-6 else 5.0)
-            for (r, _), logit in zip(scored, logits)
+            for r, logit in zip(repos, logits)
         ]
     except Exception as e:
         log.warning("Cross-encoder rerank failed, using bi-encoder scores: %s", e)
 
-    result = [_to_result(r, s) for r, s in scored]
-    result.sort(key=lambda x: -x["score"])
-    return result
+    # ── Fallback: bi-encoder cosine similarity ───────────────────────────
+    model     = _get_embedder()
+    task_emb  = model.encode(task, normalize_embeddings=True)
+    repo_embs = model.encode(texts, normalize_embeddings=True)
+    return [
+        (r, max(0.0, min(10.0, float(task_emb @ emb) * 10)))
+        for r, emb in zip(repos, repo_embs)
+    ]
+
+
+def warm_models() -> None:
+    """
+    Preload the reranker so the first user search doesn't eat ~9s of model
+    load. Called from the FastAPI startup hook; safe to fail (the model just
+    loads lazily on first use instead).
+    """
+    try:
+        _get_reranker().predict([("warmup", "warmup text")])
+        log.info("Search reranker warmed up")
+    except Exception as e:
+        log.warning("Reranker warmup failed (will load lazily): %s", e)
 
 
 async def _rank_repos(repos: list[dict], task: str) -> list[dict]:
     candidates = repos[:MAX_CANDIDATES]
     try:
-        return await asyncio.to_thread(_embed_rank, candidates, task)
+        scored = await asyncio.to_thread(_embed_rank, candidates, task)
+
+        # Cheap prerank (relevance + popularity only) decides who is worth
+        # spending a Contents API call on. Runnability can then reorder the
+        # shortlist, but never has to be guessed for the long tail.
+        scored.sort(
+            key=lambda p: -(p[1] * 0.7 + _star_weight(p[0].get("stars_int", 0)) * 0.3)
+        )
+        await _probe_runnability([r for r, _ in scored[:PROBE_TOP_N]])
+
+        # Relevance floor — see MIN_SEMANTIC. Applied after the prerank so a
+        # popular-but-unrelated repo can't buy its way in on stars alone. Kept
+        # only if it would leave us something to show.
+        relevant = [p for p in scored if p[1] >= MIN_SEMANTIC]
+        if len(relevant) >= RESULT_LIMIT:
+            scored = relevant
+
+        result = [_to_result(r, s) for r, s in scored]
+        result.sort(key=lambda x: -x["score"])
+        return result
     except Exception as e:
         log.warning("Embedding ranking failed, falling back to star sort: %s", e)
         sorted_repos = sorted(candidates, key=lambda r: -r.get("stars_int", 0))
-        return [
-            {
-                "full_name":   r["full_name"],
-                "name":        r["name"],
-                "owner":       r["owner"],
-                "stars":       _fmt_stars(r.get("stars_int", 0)),
-                "language":    r.get("language", "Python"),
-                "description": r.get("snippet", "")[:150],
-                "icon":        "📦",
-                "score":       round(7.0 - i * 0.3, 1),
-            }
-            for i, r in enumerate(sorted_repos[:3])
-        ]
+        # Same output shape as _to_result so the UI never has to special-case
+        # the degraded path — only the score is synthetic.
+        out = []
+        for i, r in enumerate(sorted_repos[:RESULT_LIMIT]):
+            item = _to_result(r, 7.0)
+            item["score"] = round(7.0 - i * 0.3, 1)
+            out.append(item)
+        return out
+
+
+_REFINE_SYSTEM = (
+    "You suggest 3 alternative search queries that narrow or sharpen a "
+    "developer's repository search. Each must be a DIFFERENT, more specific "
+    "sub-area or sibling technique of the original — never a restatement of "
+    "it, never broader than it. Title Case, 2-4 words each, no punctuation. "
+    "Return ONLY a JSON array of 3 strings.\n\n"
+    "Example — for \"sentiment analysis\": "
+    '["Emotion Analysis", "Intent Classification", "Topic Modeling"]\n'
+    "Example — for \"discord music bot\": "
+    '["Voice Channel Bot", "Spotify Integration", "Audio Queue Manager"]'
+)
+
+
+async def _refine_suggestions(task: str, query: str) -> list[str]:
+    """3 chips shown under the search bar; failure is non-fatal (returns [])."""
+    try:
+        raw = await llm_chat(
+            system=_REFINE_SYSTEM,
+            user=f"Original request: {task}\nCanonical topic: {query}",
+            # Generous budget for the same reasoning-model reason as
+            # _normalize_query — see the note there.
+            max_tokens=400, temperature=0.4,
+        )
+        parsed = _parse_json(raw)
+        if isinstance(parsed, dict):          # tolerate {"suggestions": [...]}
+            parsed = next(
+                (v for v in parsed.values() if isinstance(v, list)), []
+            )
+        out, seen = [], {query.lower(), task.lower()}
+        for s in parsed if isinstance(parsed, list) else []:
+            s = str(s).strip().strip('"')
+            if s and s.lower() not in seen:
+                seen.add(s.lower())
+                out.append(s)
+        return out[:3]
+    except Exception as e:
+        log.warning("Refine-suggestion generation failed: %s", e)
+        return []
 
 
 async def _llm_recall_repos(task: str) -> list[dict]:
