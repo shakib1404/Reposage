@@ -40,11 +40,11 @@ export default function SelectPage({
   }
 
   return (
-    <div style={{ maxWidth: 1080, margin: '0 auto', padding: '28px 24px' }} className="fade-in">
-      <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 4, letterSpacing: '-0.01em' }}>
+    <div style={{ maxWidth: 1080, margin: '0 auto', padding: '40px 24px 28px' }} className="fade-in">
+      <h2 style={{ fontSize: 24, fontWeight: 600, marginBottom: 6, letterSpacing: '-0.03em' }}>
         Select a repository
       </h2>
-      <p style={{ color: 'var(--txt2)', fontSize: 13, marginBottom: 20 }}>
+      <p style={{ color: 'var(--txt2)', fontSize: 13.5, marginBottom: 22 }}>
         Task: <em style={{ color: 'var(--txt)' }}>{task}</em>
       </p>
 

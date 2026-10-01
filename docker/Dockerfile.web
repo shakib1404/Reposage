@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+# ─────────────────────────────────────────────────────────────────────────────
+#  RepoSage web tier — builds the React SPA, serves it, and reverse-proxies
+#  /api to the backend container (Caddy also terminates TLS automatically).
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM node:20-alpine AS build
+WORKDIR /src
+
+# Copy the manifest first so `npm ci` is cached and only re-runs when
+# dependencies actually change, not on every source edit.
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+
+COPY frontend/ ./
+RUN npm run build
+
+
+FROM caddy:2-alpine
+
+# The SPA is served from disk; api.js calls the backend at the relative path
+# `/api`, so the app only works when something serves both from one origin —
+# that "something" is the Caddyfile below.
+COPY --from=build /src/dist /srv
+COPY docker/Caddyfile /etc/caddy/Caddyfile
+
+EXPOSE 80 443

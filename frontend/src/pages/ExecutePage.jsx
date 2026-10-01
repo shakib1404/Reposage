@@ -4,7 +4,7 @@ import LoopFeed from '../components/LoopFeed'
 
 export default function ExecutePage({ task, selectedRepo, analysis, setExecResult, jobId, setJobId, inputFiles, unlock, go }) {
   const [events, setEvents]   = useState([])
-  const [metrics, setMetrics] = useState({ calls:0, tokens:0, iters:0, files:0, ctx_tokens:1200 })
+  const [metrics, setMetrics] = useState({ calls:0, tokens:0, iters:0, files:0 })
   const [tools, setTools]     = useState({})
   const [done, setDone]       = useState(false)
   const [summary, setSummary] = useState('')
@@ -41,14 +41,14 @@ export default function ExecutePage({ task, selectedRepo, analysis, setExecResul
         return
       }
       setEvents(prev => [...prev, ev])
-      if (ev.metrics) setMetrics(ev.metrics)
+      // Merge, don't replace: an event that carries a partial metrics object
+      // would otherwise blank out every field it omits.
+      if (ev.metrics) setMetrics(prev => ({ ...prev, ...ev.metrics }))
       if (ev.tool) setTools(prev => ({ ...prev, [ev.tool]: (prev[ev.tool] || 0) + 1 }))
     }, jobId, inputFiles || [])
     cleanupRef.current = cleanup
     return () => cleanup?.()
   }, [])
-
-  const ctxPct = Math.min((metrics.ctx_tokens / 8000) * 100, 100)
 
   return (
     <>
@@ -90,7 +90,10 @@ export default function ExecutePage({ task, selectedRepo, analysis, setExecResul
             { label:'LLM calls',   value: metrics.calls },
             { label:'Tokens',      value: metrics.tokens?.toLocaleString() },
             { label:'Iterations',  value: metrics.iters },
-            { label:'Files read',  value: metrics.files },
+            // Backend sends repo_ctx["file_count"] here — every file in the
+            // cloned workspace, not the ones the model opened. A repo with a
+            // committed venv/ made this read "Files read 6,537".
+            { label:'Workspace files', value: metrics.files?.toLocaleString() },
           ].map(m => (
             <div key={m.label} style={{ display:'flex', justifyContent:'space-between', fontSize:12, marginBottom:6 }}>
               <span style={{ color:'var(--txt2)' }}>{m.label}</span>
@@ -99,12 +102,11 @@ export default function ExecutePage({ task, selectedRepo, analysis, setExecResul
           ))}
         </SideCard>
 
-        <SideCard title="Context window">
-          <div style={{ height:6, background:'var(--bg3)', borderRadius:3, overflow:'hidden', marginBottom:6 }}>
-            <div style={{ height:'100%', width:ctxPct+'%', background: ctxPct>80?'var(--yellow)':'var(--accent)', borderRadius:3, transition:'width 0.4s' }} />
-          </div>
-          <div style={{ fontSize:11, color:'var(--txt2)' }}>{(metrics.ctx_tokens/1000).toFixed(1)}k / 8k tokens</div>
-        </SideCard>
+        {/* A "Context window" card used to sit here showing `ctx_tokens`,
+            which the backend has never sent — it rendered a hardcoded 1.2k
+            until the first metrics event, then "NaNk / 8k tokens" for the
+            rest of the run. Removed rather than faked; the Tokens row above
+            is a figure the executor actually measures. */}
 
         {Object.keys(tools).length > 0 && (
           <SideCard title="Tools used">

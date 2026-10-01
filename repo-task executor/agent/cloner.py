@@ -50,11 +50,33 @@ class RepoCloner:
         token = os.getenv("GITHUB_TOKEN", "")
         repo_name = self._repo_name(github_url)
         import httpx
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        r = httpx.get(f"https://api.github.com/repos/{repo_name}", headers=headers, timeout=10)
-        if r.status_code == 200:
-            return r.json().get("default_branch", "main")
-        return "main"
+        url = f"https://api.github.com/repos/{repo_name}"
+
+        # Try authenticated first (needed for private repos), then anonymously.
+        # A dead or rate-limited token makes the authenticated call 401 even on
+        # a PUBLIC repo, and the old code then silently assumed "main" — which
+        # for a master-default repo means the PR is opened against a base that
+        # does not exist. The unauthenticated retry resolves that case.
+        attempts = []
+        if token:
+            attempts.append({"Authorization": f"Bearer {token}"})
+        attempts.append({})
+
+        for headers in attempts:
+            try:
+                r = httpx.get(url, headers=headers, timeout=10)
+            except Exception:
+                continue
+            if r.status_code == 200:
+                return r.json().get("default_branch", "main")
+
+        # Last resort: whatever the clone actually checked out beats a guess.
+        try:
+            import git
+            return git.Repo(self.workspace_dir).active_branch.name
+        except Exception:
+            log.warning("Could not detect the default branch — assuming 'main'")
+            return "main"
 
     # ------------------------------------------------------------------
     # Helpers

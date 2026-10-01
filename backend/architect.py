@@ -355,8 +355,11 @@ async def generate_architecture(repo_full_name: str) -> AsyncGenerator[dict, Non
     await asyncio.sleep(0)
 
     try:
+        # Reasoning model burns part of max_tokens on internal reasoning
+        # before emitting content; 1500 risks an empty completion on a
+        # large architecture. Cap, not target — headroom is free.
         expl_raw = await llm_chat(
-            _EXPLAIN_SYSTEM, user_msg, max_tokens=1500, metrics=metrics
+            _EXPLAIN_SYSTEM, user_msg, max_tokens=6000, metrics=metrics
         )
     except Exception as exc:
         yield {"type": "error", "message": f"Explanation LLM call failed: {exc}"}

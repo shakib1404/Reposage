@@ -17,6 +17,22 @@ from github import Github, GithubException
 from utils.logger import log
 
 
+def scrub_secrets(text: str) -> str:
+    """Redact anything that looks like a credential in git/GitHub output.
+
+    git prints the full remote URL on failure, which embeds the token. This
+    ran once with a real ghp_ token rendered verbatim in the web UI.
+    """
+    text = re.sub(r"(gh[pousr]_)[A-Za-z0-9]{16,}", r"\1<redacted>", text)
+    text = re.sub(r"(github_pat_)[A-Za-z0-9_]{20,}", r"\1<redacted>", text)
+    # https://user:secret@host  and  https://secret@host
+    text = re.sub(r"(https?://)[^/\s:@]+(?::[^/\s@]+)?@", r"\1<redacted>@", text)
+    tok = os.getenv("GITHUB_TOKEN", "")
+    if tok and len(tok) > 8:
+        text = text.replace(tok, "<redacted>")
+    return text
+
+
 class GitHubPRAgent:
     def __init__(self, workspace_dir: str, github_url: str):
         self.workspace_dir = workspace_dir
@@ -46,9 +62,22 @@ class GitHubPRAgent:
         local_repo.git.commit("-m", commit_msg)
         log.success("Committed changes")
 
-        # Push with token
-        remote_url = f"https://{self.token}@github.com/{self.repo_name}.git"
-        local_repo.git.push(remote_url, branch_name)
+        # Push with token.
+        #
+        # The URL needs BOTH halves of basic auth. "https://<token>@github.com"
+        # gives git a username and no password, so it falls back to prompting —
+        # and with no TTY that dies as
+        #     fatal: could not read Password for 'https://ghp_...@github.com'
+        # with the raw token in the message. GitHub's documented form is a
+        # fixed username plus the token as the password.
+        remote_url = f"https://x-access-token:{self.token}@github.com/{self.repo_name}.git"
+        try:
+            local_repo.git.push(remote_url, branch_name)
+        except Exception as exc:
+            # git echoes the remote URL in its errors, so anything raised here
+            # can carry the token into logs and into the browser. Never let the
+            # raw value out.
+            raise RuntimeError(f"git push failed: {scrub_secrets(str(exc))}") from None
         log.success(f"Pushed branch: {branch_name}")
 
         return branch_name
@@ -84,9 +113,17 @@ class GitHubPRAgent:
             log.success(f"PR created: {pr.html_url}")
             return pr.html_url
         except GithubException as e:
-            # PR may already exist
-            log.warning(f"PR creation failed ({e}), returning branch URL instead")
-            return f"https://github.com/{self.repo_name}/tree/{branch_name}"
+            # A PR can legitimately fail to open — one already exists for this
+            # branch, or the token lacks pull-request scope. The pushed branch
+            # is still useful, so fall back to it rather than losing the work,
+            # but say plainly that no PR was opened: the caller prints this as
+            # "PR URL", and a /tree/ link silently standing in for a PR reads
+            # as success when the requested thing did not happen.
+            log.warning(f"PR NOT created ({scrub_secrets(str(e))}) — "
+                        f"the fix is pushed to branch '{branch_name}', "
+                        f"open the PR manually")
+            return (f"(no PR — branch only) "
+                    f"https://github.com/{self.repo_name}/tree/{branch_name}")
 
     def get_default_branch(self) -> str:
         if not self.token:

@@ -1,0 +1,60 @@
+# Build context hygiene. Without this the 4.9GB persistent_venv and
+# node_modules get uploaded to the Docker daemon on every build, which makes
+# an otherwise ~2 minute build take many minutes and can exhaust disk on a
+# small droplet.
+
+# Virtualenvs — recreated inside the image, never copied in
+.venvs/
+backend/.venvs/
+venv/
+.venv/
+env/
+ENV/
+
+# Node — the web image runs its own `npm ci`
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Secrets — supplied at runtime via docker compose env_file, never baked in.
+# The ** prefix is load-bearing: a bare `.env` only matches the context ROOT,
+# so "repo-task executor/.env" (ANTHROPIC_API_KEY, GITHUB_TOKEN) was being
+# copied straight into the image layer — and would ship to anyone the image
+# is pushed to.
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/secrets/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local run artifacts
+*.log
+logs/
+outputs/
+# `workspace/` alone only matches at the context root — the 37MB of cloned
+# repos under "repo-task executor/workspace/" needs the ** form. The quoted
+# variant that used to sit here never matched anything: .dockerignore has no
+# quoting, so it looked for a directory literally named `"repo-task`.
+**/workspace/
+**/.ruff_cache/
+
+# VCS / editor / OS
+.git/
+.gitignore
+.idea/
+.vscode/
+.claude/
+.DS_Store
+
+# Docs that don't affect the build
+doc/
+*.md
+!backend/**/*.md

@@ -167,6 +167,10 @@ export default function OutputPage({ task, selectedRepo, analysis, execResult, u
   const imageFiles = files.filter(f => IMAGE_EXTS.has(ext(f.name)))
   const otherFiles = files.filter(
     f => !IMAGE_EXTS.has(ext(f.name)) && f.name !== 'run_final.sh')
+  // run_final.sh has its own card above, so it is filtered out of the list.
+  // Count what is actually listed — using files.length made the header read
+  // "Output files (3)" above two rows.
+  const shownCount = imageFiles.length + otherFiles.length
 
   function fetchPreview(jid, name) {
     setPreviewError('')
@@ -413,7 +417,7 @@ export default function OutputPage({ task, selectedRepo, analysis, execResult, u
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
           <SectionLabel>
             Output files
-            {loading ? ' (loading…)' : ` (${files.length})`}
+            {loading ? ' (loading…)' : ` (${shownCount})`}
           </SectionLabel>
           <div style={{ flex: 1 }} />
           {jobId && (
@@ -435,7 +439,7 @@ export default function OutputPage({ task, selectedRepo, analysis, execResult, u
             Error: {error}
           </div>
         )}
-        {!loading && files.length === 0 && !error && jobId && (
+        {!loading && shownCount === 0 && !error && jobId && (
           <div style={{ fontSize: 13, color: 'var(--txt3)', padding: '6px 0' }}>
             No output files yet. Click <strong>↻ Refresh</strong> if execution just finished.
           </div>

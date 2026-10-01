@@ -3,6 +3,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import shutil
 import sys
 import uuid
@@ -88,9 +89,23 @@ async def warm_db():
     await _asyncio.gather(_warm_bcrypt(), _warm_mongo(), _warm_reranker())
 
 
+# In the Docker deployment Caddy serves the SPA and proxies /api to this app,
+# so browser requests are same-origin and CORS never comes into play. These
+# defaults are the local Vite dev server; CORS_ALLOW_ORIGINS (comma-separated)
+# overrides them for any deployment that does split the two across origins,
+# without needing a code change.
+_CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "CORS_ALLOW_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -463,9 +478,64 @@ async def submit_credentials(job_id: str, req: CredentialSubmit):
 
 # ── RepoTask Executor (SSE) — uses repo-task executor agent pipeline ──────────
 
-# Path to the repo-task executor package (sibling of backend/)
-_REPO_TASK_DIR = Path(__file__).parent.parent / "repo-task executor"
+# Where the repo-task executor package lives.
+#
+# On a dev checkout it is a sibling of backend/ (reposage/repo-task executor).
+# In the container backend/ IS the root (/app), so "parent.parent" resolved to
+# "/" and every run died with
+#     can't open file '/repo-task executor/run_task.py'
+# — the package is copied to /opt/repo-task-executor there instead. Resolve by
+# looking, and let REPO_TASK_DIR override for anything else.
+def _find_repo_task_dir() -> Path:
+    env = os.getenv("REPO_TASK_DIR", "").strip()
+    candidates = [Path(env)] if env else []
+    candidates += [
+        Path(__file__).parent.parent / "repo-task executor",   # dev checkout
+        Path("/opt/repo-task-executor"),                       # container image
+    ]
+    for c in candidates:
+        if (c / "run_task.py").is_file():
+            return c
+    # Nothing found — return the first candidate so the error message names a
+    # path the operator can actually act on.
+    return candidates[0]
+
+
+_REPO_TASK_DIR   = _find_repo_task_dir()
 _RUN_TASK_SCRIPT = _REPO_TASK_DIR / "run_task.py"
+
+# Workspaces are cloned repos plus their edits — they must go somewhere
+# writable, which the image's /opt tree is not meant to be.
+_REPO_TASK_WORKSPACES = Path(
+    os.getenv("REPO_TASK_WORKSPACE_ROOT")
+    or (os.getenv("EXECUTOR_OUTPUT_ROOT", "") and
+        os.path.join(os.environ["EXECUTOR_OUTPUT_ROOT"], "taskexec"))
+    or str(_REPO_TASK_DIR / "workspace")
+)
+
+
+# Anything the agent subprocess prints goes straight to the browser. git
+# embeds the push token in its error messages, so a failed push once rendered
+# a live ghp_ token in the UI. Redact on the way out, regardless of which
+# subcomponent leaked it.
+_SECRET_PATTERNS = [
+    re.compile(r"(gh[pousr]_)[A-Za-z0-9]{16,}"),
+    re.compile(r"(github_pat_)[A-Za-z0-9_]{20,}"),
+    re.compile(r"(sk-ant-)[A-Za-z0-9\-_]{20,}"),
+    re.compile(r"(https?://)[^/\s:@]+(?::[^/\s@]+)?@"),
+]
+_SECRET_ENV_VARS = ("GITHUB_TOKEN", "ANTHROPIC_API_KEY", "JWT_SECRET",
+                    "SERPER_API_KEY", "JINA_API_KEY", "GMAIL_PASS")
+
+
+def _scrub_secrets(text: str) -> str:
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub(r"\1<redacted>", text)
+    for var in _SECRET_ENV_VARS:
+        val = os.getenv(var, "")
+        if val and len(val) > 8:
+            text = text.replace(val, "<redacted>")
+    return text
 
 
 @app.post("/api/taskexec")
@@ -474,18 +544,36 @@ async def task_exec(req: TaskExecRequest,
 
     async def event_stream() -> AsyncGenerator[str, None]:
         def _out(line: str) -> str:
-            return f"data: {json.dumps({'type': 'output', 'line': line})}\n\n"
+            return f"data: {json.dumps({'type': 'output', 'line': _scrub_secrets(line)})}\n\n"
 
         github_url = f"https://github.com/{req.repo_full_name}"
         job_id     = req.job_id or uuid.uuid4().hex
-        workspace  = str(_REPO_TASK_DIR / "workspace" / job_id)
+        workspace  = str(_REPO_TASK_WORKSPACES / job_id)
 
         yield _out(f"🚀  RepoTask Executor — {req.repo_full_name}")
         yield _out(f"📋  Task: {req.task}")
         yield _out("")
         await asyncio.sleep(0)
 
+        # Fail with something actionable. Without this the subprocess just
+        # prints Python's raw "can't open file ..." to the log and the run
+        # looks like an agent failure rather than a missing deployment piece.
+        if not _RUN_TASK_SCRIPT.is_file():
+            yield _out(f"✕  RepoTask Executor is not installed at {_REPO_TASK_DIR}")
+            yield _out("   The agent package was not found. Set REPO_TASK_DIR to its")
+            yield _out("   location, or rebuild the backend image so it is copied in.")
+            yield f"data: {json.dumps({'type': 'done', 'returncode': 1})}\n\n"
+            return
+
+        if not os.getenv("ANTHROPIC_API_KEY") and not (_REPO_TASK_DIR / ".env").is_file():
+            yield _out("✕  ANTHROPIC_API_KEY is not set.")
+            yield _out("   RepoTask Executor drives Claude directly (not Groq like the")
+            yield _out("   rest of RepoSage), so it needs its own key in the backend env.")
+            yield f"data: {json.dumps({'type': 'done', 'returncode': 1})}\n\n"
+            return
+
         try:
+            os.makedirs(workspace, exist_ok=True)
             # Inherit current env + keys from repo-task executor .env
             env = os.environ.copy()
             rte_env = _REPO_TASK_DIR / ".env"

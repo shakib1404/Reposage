@@ -74,23 +74,15 @@ export default function HistoryPage({ onRestore, onNew, go }) {
   )
 
   return (
-    <div style={{ maxWidth: 820, margin: '0 auto', padding: '24px 20px' }} className="fade-in">
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
-        <h2 style={{ fontSize: 16, fontWeight: 600, margin: 0 }}>Work history</h2>
+    <div style={{ maxWidth: 820, margin: '0 auto', padding: '40px 20px 28px' }} className="fade-in">
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 22 }}>
+        <h2 style={{ fontSize: 24, fontWeight: 600, margin: 0, letterSpacing: '-0.03em' }}>Work history</h2>
         <span style={{ fontSize: 12, color: 'var(--txt2)', background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 10, padding: '1px 8px' }}>
           {history.length} / 20
         </span>
         <div style={{ flex: 1 }} />
         {/* New task button */}
-        <button
-          onClick={onNew}
-          style={{
-            display: 'flex', alignItems: 'center', gap: 6,
-            padding: '8px 18px', fontSize: 13, fontWeight: 600,
-            background: 'var(--accent)', color: 'white',
-            border: 'none', borderRadius: 7, cursor: 'pointer',
-          }}
-        >
+        <button onClick={onNew} className="lp-btn lp-btn-primary" style={{ padding: '8px 18px' }}>
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
             <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
           </svg>

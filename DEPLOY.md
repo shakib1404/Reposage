@@ -1,0 +1,236 @@
+# Deploying RepoSage
+
+RepoSage clones arbitrary public repositories, installs their dependencies and
+**runs their code**. That single fact drives every decision below: it rules out
+serverless platforms entirely, and it makes the security section non-optional.
+
+---
+
+## 1. Where this can run
+
+| Platform | Works? | Why |
+|---|---|---|
+| **Azure VM** (Azure for Students) | ✅ recommended | $100 credit / 12 months, no credit card. See §2 |
+| **Oracle Cloud Always Free** | ✅ best long-term | 4 ARM cores / 24GB **free forever**; signup capacity can be flaky |
+| Hetzner / Linode / any VPS | ✅ | ~€4-6/mo for the same specs |
+| DigitalOcean droplet | ⚠️ | The student credit is now $5, not $200 — about a month on the smallest (512MB) droplet, which can't run this |
+| Fly.io / Railway | ⚠️ | Works, but needs a paid tier for enough RAM |
+| Render free tier | ❌ | 512MB RAM — torch alone won't fit |
+| Vercel / Netlify / Cloudflare Workers / Lambda | ❌ | No subprocess, no persistent FS, request timeouts far below a 200s execution, and SSE doesn't survive |
+
+On Azure, the VM is the right service. App Service and Container Apps look
+cheaper but sandbox the container, cap request duration well under a 200s
+execution, and don't give the subprocess/filesystem freedom the executor needs.
+
+**Sizing:** 2 vCPU / 4GB RAM / 80GB disk is the comfortable minimum. The backend
+image is ~3.3GB, the reranker model holds ~500MB resident, and each concurrent
+repo execution builds its own throwaway venv. 2GB works for light single-user
+use — measured peak is 621MB during a search, so it fits with room to spare.
+
+---
+
+## 2. Azure, step by step (GitHub Student — $100 / 12 months)
+
+**Claim the credit:** `azure.microsoft.com/free/students` → sign in with the
+account linked to your GitHub Student pack. $100, 12 months, no card required.
+
+**Pick a size.** B-series VMs are *burstable* — they bank CPU credits while
+idle and spend them on bursts, which fits this workload well (long idle
+stretches, then a heavy 200s execution).
+
+| Size | vCPU / RAM | ~cost/mo | $100 runs for | Verdict |
+|---|---|---|---|---|
+| B1s | 1 / 1GB | ~$8 | ~12 mo | ❌ torch won't fit |
+| **B1ms** | 1 / 2GB | ~$15 | **~6 mo** | ✅ tight but works — use §4 |
+| **B2s** | 2 / 4GB | ~$30 | ~3 mo | ✅ comfortable |
+
+Prices vary by region — check the Azure pricing calculator for yours.
+
+**Create it** (portal: *Virtual machines → Create*, or CLI):
+
+```bash
+az login
+az group create --name reposage-rg --location eastus
+
+az vm create \
+  --resource-group reposage-rg \
+  --name reposage-vm \
+  --image Ubuntu2404 \
+  --size Standard_B1ms \
+  --admin-username azureuser \
+  --generate-ssh-keys \
+  --storage-sku StandardSSD_LRS \
+  --os-disk-size-gb 64
+
+az vm open-port --resource-group reposage-rg --name reposage-vm --port 80  --priority 1001
+az vm open-port --resource-group reposage-rg --name reposage-vm --port 443 --priority 1002
+```
+
+Two cost details that matter: pick **StandardSSD_LRS**, not Premium (Premium
+can add $10-20/mo on its own), and 64GB of disk is plenty.
+
+Then `ssh azureuser@<public-ip>` and continue from §3.
+
+### Making $100 last the full 12 months
+
+Azure bills compute only while a VM is **deallocated-vs-running**, so a
+portfolio app that's only up for demos costs a fraction of the sticker price.
+Note that shutting down from inside the OS does *not* stop billing — you must
+deallocate:
+
+```bash
+az vm deallocate --resource-group reposage-rg --name reposage-vm   # stops billing
+az vm start      --resource-group reposage-rg --name reposage-vm   # ~40s to come back
+```
+
+Or set a nightly auto-shutdown (portal: *VM → Auto-shutdown*), which roughly
+halves the burn:
+
+```bash
+az vm auto-shutdown --resource-group reposage-rg --name reposage-vm --time 2000
+```
+
+With `restart: unless-stopped` in `docker-compose.yml`, the stack comes back on
+its own after a start — nothing to re-run manually.
+
+> The public IP changes on each deallocate/start unless you attach a **static**
+> IP. If you're using a domain with HTTPS, make the IP static or the DNS record
+> goes stale and the cert stops renewing.
+
+---
+
+## 3. One-time setup on the server
+
+Ubuntu 24.04, as root:
+
+```bash
+# Docker + compose plugin
+curl -fsSL https://get.docker.com | sh
+
+# Swap — cheap insurance against an OOM kill during a heavy pip install
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+# Firewall: only SSH + web
+ufw allow OpenSSH && ufw allow 80 && ufw allow 443 && ufw --force enable
+
+git clone https://github.com/shakib1404/Reposage.git
+cd Reposage/reposage
+cp deploy.env.example .env
+nano .env          # fill in the values — see §5
+```
+
+---
+
+## 4. If you chose a 2GB VM (B1ms)
+
+2GB is workable for single-user use, but the defaults in `docker-compose.yml`
+assume 4GB. Use the low-memory override, which lowers the container limit and
+shrinks the build tmpfs so it can't outgrow RAM:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.lowmem.yml up -d --build
+```
+
+Swap is **not optional** at this size — §3 sets up 2GB; make it 4GB on a 2GB VM:
+
+```bash
+fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+```
+
+Expect to run one execution at a time. Building the image on a 2GB VM can also
+be tight; if `docker compose build` gets OOM-killed, build it once on your
+laptop, push to Docker Hub, and pull it on the VM instead.
+
+---
+
+## 5. Configuration
+
+Everything lives in `.env` (never committed — `.gitignore` already blocks it).
+
+| Variable | Notes |
+|---|---|
+| `SITE_ADDRESS` | `:80` for IP-only. Set it to your domain (e.g. `reposage.me`) and Caddy issues + renews a Let's Encrypt cert automatically. **Point the DNS A record at the VM first** or the cert request fails. |
+| `MONGO_URL` | Your existing Atlas free tier. In Atlas → **Network Access**, whitelist the VM's public IP. |
+| `JWT_SECRET` | Generate a fresh one: `openssl rand -hex 32`. Don't reuse the dev value. |
+| `GROQ_API_KEY_1..4` | At least `_1`. The others are automatic fallbacks on rate-limit. |
+| `GITHUB_TOKEN` | Classic token, **no scopes ticked**. Lifts search from 60 → 5000 req/hour. |
+| `SERPER_API_KEY`, `JINA_API_KEY` | Repo search sources. |
+
+> The student pack also includes a free Namecheap domain for a year — pair it
+> with `SITE_ADDRESS` and you get HTTPS with no extra work.
+
+---
+
+## 6. Deploy
+
+```bash
+docker compose up -d --build     # first build ~5 min (torch + models)
+docker compose logs -f           # watch it come up
+```
+
+Wait for `Search reranker warmed up` followed by `Application startup complete`,
+then open the VM's public IP (or your domain) in a browser.
+
+Updating later:
+
+```bash
+git pull && docker compose up -d --build
+```
+
+---
+
+## 7. Security — read this before exposing it publicly
+
+RepoSage is, by design, a service that executes untrusted code on demand. On an
+open URL that is a free compute host for whoever finds it. What's already in
+place and what you should add:
+
+**Already configured in `docker-compose.yml`:**
+- Backend runs as an unprivileged user (uid 10001), never root
+- `mem_limit: 3g`, `pids_limit: 512`, `cpus: 1.5` — a runaway or hostile repo
+  gets killed inside its container instead of taking the VM down, and
+  there's always CPU headroom left to SSH in
+- Repo workspaces build in a 6GB `tmpfs`, so execution churn never fills the
+  real disk
+
+**You should still do:**
+1. **Close registration**, or keep the URL private. JWT auth exists, but an open
+   signup form means anyone can register and run code.
+2. **Keep an eye on disk**: `docker system prune -af --volumes` occasionally,
+   and watch `/data/outputs` (a Docker volume) which grows with every run.
+3. **Don't put secrets in the execution environment** that the executed repos
+   shouldn't see.
+
+If this is for a portfolio rather than real users, the safest option is to not
+expose it continuously at all — push the image to Docker Hub, keep the repo and
+a demo video public, and bring the site up only when you need to show it.
+
+---
+
+## 8. Notes on the image
+
+The backend image is ~3.3GB, deliberately:
+
+- **torch is the CPU-only build** (`2.14.0+cpu`), installed from PyTorch's CPU
+  index *before* `requirements.txt`. Left to resolve on its own, pip pulls the
+  CUDA build and drags in ~2.7GB of `nvidia/*` plus ~700MB of `triton` that this
+  app never uses — the difference between a 3.3GB image and a 7GB one.
+- **The two sentence-transformers models are baked in** (~176MB), so the first
+  search doesn't pay a download and the app still starts if HuggingFace is
+  unreachable.
+- **`build-essential` stays in the final image on purpose.** It isn't build-time
+  only: repos being analysed routinely have dependencies with C extensions that
+  compile during *their* pip install, and removing it breaks those runs.
+
+---
+
+## 9. Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| UI blank while a run is in progress | A proxy is buffering SSE. Caddy is configured with `flush_interval -1`; if you swap in nginx you need `proxy_buffering off;` |
+| Execution/audit cut off partway | Proxy read timeout. The Caddyfile allows 30m; match that in any replacement. |
+| `pymongo ServerSelectionTimeout` | Droplet IP isn't whitelisted in Atlas Network Access. |
+| Cert request fails on startup | DNS A record isn't pointing at the VM yet, or 80/443 aren't open in `ufw`. |
+| Container OOM-killed during a run | Raise `mem_limit`, or move to a larger VM. |

@@ -1,0 +1,37 @@
+# SITE_ADDRESS controls both the hostname and whether TLS is on:
+#   ":80"              → plain HTTP, for an IP-only deployment or local testing
+#   "reposage.me"      → Caddy obtains and renews a Let's Encrypt cert itself
+# Set it in .env; docker-compose passes it through.
+{$SITE_ADDRESS} {
+	encode gzip
+
+	# ── API + SSE ────────────────────────────────────────────────────────
+	# Almost every interesting endpoint here is a long-lived Server-Sent
+	# Events stream: /api/execute and /api/taskexec run for minutes,
+	# /api/test (audit) for ~2-4, and they report progress the whole time.
+	#
+	# `flush_interval -1` disables response buffering. Without it Caddy
+	# holds the event stream in its buffer and the UI sits completely blank
+	# until the run finishes — which looks exactly like a hung app.
+	#
+	# The long timeouts stop the proxy severing a run mid-flight; Caddy's
+	# defaults would cut the longer executions off partway through.
+	handle /api/* {
+		reverse_proxy backend:8000 {
+			flush_interval -1
+			transport http {
+				read_timeout 30m
+				write_timeout 30m
+			}
+		}
+	}
+
+	# ── Static SPA ───────────────────────────────────────────────────────
+	# Unknown paths fall back to index.html so client-side navigation
+	# survives a browser refresh / deep link.
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

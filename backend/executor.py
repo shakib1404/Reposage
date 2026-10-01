@@ -1158,7 +1158,11 @@ Return ONLY valid JSON — no markdown fences, no prose:
                 "Return ONLY valid JSON. No markdown fences. No preamble."
             ),
             user=prompt,
-            max_tokens=2000,
+            # The execution plan is the single most important LLM output in
+            # the app — everything downstream (run command, pre-steps, env
+            # vars, credential detection) comes from this JSON. Reasoning
+            # headroom so it can never come back empty on a complex repo.
+            max_tokens=6000,
             metrics=metrics,
             temperature=0.1,
         )
@@ -1592,7 +1596,8 @@ Return ONLY valid JSON:
     try:
         raw  = await llm_chat(
             system="You are a Python debugging expert. Return ONLY valid JSON.",
-            user=prompt, max_tokens=1000, metrics=metrics, temperature=0.2)
+            # Reasoning headroom — see the note in _llm_diagnose.
+            user=prompt, max_tokens=4000, metrics=metrics, temperature=0.2)
         data = _parse_json(raw)
     except Exception:
         data = {

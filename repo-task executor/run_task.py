@@ -29,11 +29,18 @@ workspace_dir = sys.argv[3] if len(sys.argv) > 3 else str(_HERE / "workspace")
 
 from agent.orchestrator import AgentOrchestrator
 
+# Open a pull request rather than only pushing the branch. create_pr() has
+# always existed; this entry point just had it switched off, so a finished run
+# left the fix sitting on a branch nobody was told about.
+# Set REPO_TASK_OPEN_PR=0 to go back to push-only.
+import os
+open_pr = os.getenv("REPO_TASK_OPEN_PR", "1").strip().lower() not in ("0", "false", "no")
+
 orchestrator = AgentOrchestrator(
     workspace_dir=workspace_dir,
     max_retries=3,
     top_k=15,
-    open_pr=False,
+    open_pr=open_pr,
     run_tests=True,
 )
 

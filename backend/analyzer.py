@@ -157,6 +157,7 @@ async def analyze_repo(
             "core_scores":     [m["score"] for m in top10],
             "key_files":       [m["path"] for m in top10],
             "tree":            _collect_file_tree(work_path),
+            "file_tree":       _collect_repo_file_tree(work_path),
             "import_cycles":   _find_import_cycles(mdg_edges),
             "task_plan":       [],
             "readme_summary":  "",
@@ -1324,7 +1325,16 @@ Write a docstring for every module and class listed above."""
                     "Return ONLY valid JSON. No markdown. No preamble. "
                     "Never invent class names, function names, or file paths."),
             user=prompt,
-            max_tokens=1500,
+            # This call has to emit a docstring for each of 25 modules and 20
+            # classes plus a 5-step plan, entry point and run command, all as
+            # one JSON object — and the configured reasoning model
+            # (openai/gpt-oss-120b) spends part of the budget thinking before
+            # it writes anything. Measured against pyinvoke/invoke (120
+            # modules, 429 classes): 1500, 3000 and 5000 all returned an empty
+            # completion with finish_reason=length; 8000 was the first that
+            # produced usable JSON. 10000 leaves headroom for larger repos.
+            # max_tokens is a cap, not a target — short answers cost no more.
+            max_tokens=10000,
             temperature=0.1,
         )
         enrichment = _parse_json(raw)
@@ -1456,7 +1466,12 @@ def _compute_metrics(data: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _collect_file_tree(workspace: str) -> list[str]:
-    """Flat file tree (relative paths, up to 100 entries) skipping noise dirs."""
+    """Flat file tree (relative paths, up to 100 entries) skipping noise dirs.
+
+    Kept as a plain list[str] because executor.py and the LLM prompts join it
+    directly ("\\n".join(tree)); the richer browser view uses
+    _collect_repo_file_tree() instead.
+    """
     ws = Path(workspace)
     tree: list[str] = []
     for root, dirs, files in os.walk(ws):
@@ -1464,6 +1479,109 @@ def _collect_file_tree(workspace: str) -> list[str]:
         for f in sorted(files):
             tree.append(str((Path(root) / f).relative_to(ws)))
     return tree[:100]
+
+
+# Entries returned to the file browser. A repo that committed its own venv or
+# node_modules can hold tens of thousands of files, which would bloat both the
+# response and the history document, so the listing is capped and reports
+# whether it was cut off.
+MAX_TREE_ENTRIES = 2000
+
+# Directories that hold a third-party dependency tree. When one of these is
+# committed to the repo it is listed as a single collapsed entry rather than
+# walked: a committed venv turned a 6KB file listing into 313KB of
+# `venv/lib/python3.10/site-packages/...` paths — 99% of the analysis payload,
+# re-saved into the history document on every run — for content nobody browses
+# here. The directory itself is still shown (it IS part of the repo, and
+# github.com lists it), just not expanded; the GitHub link on each row is
+# there for anyone who genuinely wants to look inside.
+COLLAPSE_DIRS = {
+    "venv", ".venv", "env", "virtualenv", "ENV",
+    "node_modules", ".tox", "site-packages", "vendor",
+}
+
+# ...but only when it is actually big. The name alone is not enough: pyinvoke
+# commits a deliberate `invoke/vendor/` of 27 files that is real, shipped
+# source, and collapsing it lost genuine content. Size is what actually causes
+# the problem, so that is what the rule keys on — an installed dependency tree
+# runs to thousands of files, a hand-vendored package to a few dozen.
+COLLAPSE_MIN_FILES = 200
+
+
+def _collect_repo_file_tree(workspace: str) -> dict:
+    """Full repo listing for the GitHub-style file browser.
+
+    Deliberately different from _collect_file_tree(): that one exists to feed
+    LLM prompts, so it strips build/venv noise and stops at 100 entries. This
+    one is meant to answer "what is actually IN this repository", so it hides
+    only `.git` — exactly what GitHub itself hides — and keeps vendored
+    directories the author really did commit, since those are part of the repo
+    a user sees on github.com.
+
+    Returns {"entries": [{"path", "size"}], "total": int, "truncated": bool}.
+    """
+    ws = Path(workspace)
+    entries: list[dict] = []
+    total = 0
+
+    def add(fp: Path, *, link: bool = False, collapsed: int | None = None) -> None:
+        nonlocal total
+        total += 1
+        if len(entries) >= MAX_TREE_ENTRIES:
+            return
+        try:
+            size = 0 if (link or collapsed is not None) else fp.stat().st_size
+        except OSError:              # broken symlink, permission, race
+            size = 0
+        entries.append({
+            "path": str(fp.relative_to(ws)).replace(os.sep, "/"),
+            "size": size,
+            **({"link": True} if link else {}),
+            **({"collapsed": collapsed} if collapsed is not None else {}),
+        })
+
+    def count_files(d: Path) -> int:
+        n = 0
+        for _, _, fs in os.walk(d):
+            n += len(fs)
+        return n
+
+    for root, dirs, files in os.walk(ws):
+        keep = []
+        for d in sorted(dirs):
+            if d == ".git":
+                continue
+            # __pycache__ is created by OUR OWN parsing/import tracing of the
+            # clone, so it is never part of what the repo actually contains —
+            # including it would show files github.com doesn't list.
+            if d == "__pycache__":
+                continue
+            dp = Path(root) / d
+            if dp.is_symlink():
+                # git stores a symlink as a single entry and GitHub lists it as
+                # one item. os.walk puts symlinked dirs in `dirs` and (with
+                # followlinks=False) never yields them again, so without this
+                # they'd vanish from the listing entirely.
+                add(dp, link=True)
+                continue
+            if d in COLLAPSE_DIRS:
+                n = count_files(dp)
+                if n > COLLAPSE_MIN_FILES:
+                    add(dp, collapsed=n)
+                    continue
+            keep.append(d)
+        dirs[:] = keep
+
+        for f in sorted(files):
+            if f.endswith((".pyc", ".pyo")):
+                continue             # bytecode we generated, not repo content
+            add(Path(root) / f)
+
+    return {
+        "entries":   entries,
+        "total":     total,
+        "truncated": total > len(entries),
+    }
 
 
 def _rel_to_pkg(rel_path: str, ws: Path) -> str:

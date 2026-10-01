@@ -1,0 +1,69 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    env_file:
+      - .env
+      # RepoTask Executor drives Claude directly and keeps its own keys
+      # (ANTHROPIC_API_KEY, CLAUDE_MODEL). Read at RUN time from the host —
+      # never copied into the image, which is what .dockerignore's **/.env
+      # rule now enforces. Optional, so a deployment that puts those keys in
+      # the main .env instead still starts.
+      - path: "repo-task executor/.env"
+        required: false
+    environment:
+      EXECUTOR_OUTPUT_ROOT: /data/outputs
+      # Where RepoTask Executor clones repos. Must be writable and is
+      # deliberately on the outputs volume, not in the read-only /opt package.
+      REPO_TASK_WORKSPACE_ROOT: /data/outputs/taskexec
+      # Same-origin in this setup (Caddy serves the SPA and proxies /api),
+      # so CORS is only relevant if you later split the two across hosts.
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-}
+    volumes:
+      - outputs:/data/outputs
+    restart: unless-stopped
+
+    # This container executes code from arbitrary public repositories. The
+    # limits below are the difference between a runaway/hostile repo taking
+    # down the droplet and it just failing its own run:
+    #   mem_limit  — a fork bomb or a repo that allocates endlessly gets
+    #                OOM-killed inside the container instead of swapping the
+    #                host to death
+    #   pids_limit — caps fork bombs
+    #   cpus       — leaves headroom for Caddy and sshd so you can always
+    #                still log in and stop it
+    mem_limit: 3g
+    pids_limit: 512
+    cpus: 1.5
+
+    # Repo workspaces and their throwaway venvs are built in /tmp. tmpfs
+    # keeps that churn off the droplet's disk, and the size cap means a repo
+    # with enormous dependencies fails its own install rather than filling
+    # the filesystem. Raise if you audit genuinely large projects.
+    tmpfs:
+      - /tmp:size=6g
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Persist the TLS certificates Caddy issues — without this it
+      # re-requests them on every restart and will hit Let's Encrypt rate
+      # limits after a handful of redeploys.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  outputs:
+  caddy_data:
+  caddy_config:

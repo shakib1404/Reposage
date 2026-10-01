@@ -39,7 +39,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 USE_MOCK   = os.getenv("USE_MOCK", "false").lower() == "true"
 
 # How many merged candidates get enriched + ranked. GitHub's search alone
-# can return ~19 raw items (4 sub-queries) and is listed first in merge
+# can return 19 raw items (4 sub-queries) and is listed first in merge
 # priority, so a cap of 15 was silently dropping every Jina/Serper-only
 # candidate that GitHub didn't also find — including highly-starred, clearly
 # relevant repos. Raised from 30 → 80 now that the UI shows 9 results instead

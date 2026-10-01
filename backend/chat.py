@@ -183,7 +183,9 @@ async def answer_question(
     answer = await llm_chat(
         system,
         user_msg,
-        max_tokens=1800,
+        # Headroom for the reasoning model's thinking phase — too tight a
+        # budget yields an empty answer rather than a short one.
+        max_tokens=6000,
         temperature=0.15,
         metrics=metrics,
     )

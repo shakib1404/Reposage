@@ -1,0 +1,23 @@
+# Override for a 2GB VM (e.g. Azure B1ms), applied on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lowmem.yml up -d --build
+#
+# The base file is sized for a 4GB host. On 2GB the defaults are actively
+# harmful: a 3g container limit exceeds total RAM (so the limit never engages
+# and the OOM killer hits the host instead of the container), and a 6g build
+# tmpfs is RAM-backed — a big repo's venv would consume memory until the box
+# died. Set up 4GB of swap alongside this; see DEPLOY.md §2B.
+services:
+  backend:
+    # Leaves ~800MB for the OS, Caddy and page cache. The resident set is
+    # ~600-900MB once both sentence-transformers models are loaded, so this
+    # allows roughly one concurrent execution plus its pip install.
+    mem_limit: 1200m
+    cpus: 0.9
+
+    # tmpfs is RAM-backed, so on a 2GB host it has to be small. Repos with
+    # heavy dependencies will fail their install rather than take the VM down —
+    # the right trade at this size. Raise it (or drop the tmpfs line entirely
+    # so workspaces build on disk) if you need to analyse larger projects.
+    tmpfs:
+      - /tmp:size=1g

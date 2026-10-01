@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import mermaid from 'mermaid'
 import { streamArchitect } from '../api'
+import MiniMarkdown from '../components/MiniMarkdown'
 
 // ── Mermaid initialisation ────────────────────────────────────────────────────
 mermaid.initialize({
@@ -227,11 +228,13 @@ function ExplanationAccordion({ text }) {
         <div style={{
           padding: '0 16px 14px',
           fontSize: 12, color: 'var(--txt2)', lineHeight: 1.7,
-          whiteSpace: 'pre-wrap',
           borderTop: '1px solid var(--border)',
           paddingTop: 12,
         }}>
-          {text}
+          {/* The model answers in Markdown. Printed as a literal string this
+              read as one long wall of `**heading**` and backticks — 34 stray
+              `**` and 180 backticks on psf/requests alone. */}
+          <MiniMarkdown text={text} />
         </div>
       )}
     </div>

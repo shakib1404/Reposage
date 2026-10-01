@@ -107,9 +107,14 @@ export default function SearchPage({ task, setTask, setRepos, setSuggestions, se
   }
 
   return (
-    <div style={{ maxWidth: 640, margin: '0 auto', padding: '32px 24px' }} className="fade-in">
-      <h2 style={{ fontSize: 22, fontWeight: 600, marginBottom: 6, letterSpacing: '-0.02em' }}>What do you want to build?</h2>
-      <p style={{ color: 'var(--txt2)', fontSize: 13, marginBottom: 24 }}>Describe your task in plain English. RepoSage will find the best GitHub repos and execute it autonomously.</p>
+    <div style={{ maxWidth: 680, margin: '0 auto', padding: '56px 24px 48px' }} className="fade-in">
+      <h2 style={{ fontSize: 30, fontWeight: 600, marginBottom: 8, letterSpacing: '-0.035em', lineHeight: 1.15 }}>
+        What do you want to <span className="lp-grad-text">build</span>?
+      </h2>
+      <p style={{ color: 'var(--txt2)', fontSize: 14, marginBottom: 26, lineHeight: 1.6 }}>
+        Describe your task in plain English. RepoSage finds a GitHub repo that solves it,
+        maps the codebase, and runs it for you.
+      </p>
 
       {/* Input */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
@@ -119,12 +124,13 @@ export default function SearchPage({ task, setTask, setRepos, setSuggestions, se
           onKeyDown={onKey}
           placeholder="e.g. Remove scratches from an old photo"
           style={{
-            flex: 1, padding: '10px 14px', border: '1px solid var(--border2)',
+            flex: 1, padding: '13px 16px', border: '1px solid var(--border2)',
             borderRadius: 'var(--radius)', background: 'var(--bg2)', color: 'var(--txt)',
-            fontFamily: 'var(--font)', fontSize: 14, outline: 'none',
+            fontFamily: 'var(--font)', fontSize: 14.5, outline: 'none',
+            transition: 'border-color 0.15s, box-shadow 0.15s',
           }}
-          onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-          onBlur={e => e.target.style.borderColor = 'var(--border2)'}
+          onFocus={e => { e.target.style.borderColor = 'var(--accent)'; e.target.style.boxShadow = '0 0 0 3px rgba(93,142,255,0.14)' }}
+          onBlur={e  => { e.target.style.borderColor = 'var(--border2)'; e.target.style.boxShadow = 'none' }}
         />
         <Btn onClick={doSearch} disabled={loading} primary>
           {loading ? <span className="spin" style={{ display:'inline-block',width:14,height:14,border:'2px solid rgba(255,255,255,0.3)',borderTopColor:'white',borderRadius:'50%' }}/> : <SearchIcon />}
@@ -229,14 +235,14 @@ export default function SearchPage({ task, setTask, setRepos, setSuggestions, se
       {/* How it works */}
       <div style={{ marginTop: 36, display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
         {[
-          { icon: '🔍', title: 'Deep repo search', desc: 'Serper + Jina fetch and rank the best GitHub repos for your task' },
-          { icon: '🌳', title: 'Structural analysis', desc: 'HCT, FCG, MDG graphs built — every module scored by 6 features' },
-          { icon: '🤖', title: 'Autonomous execution', desc: 'Groq LLM explores, writes code, debugs, and iterates until done' },
+          { icon: '🎯', title: 'Ranked shortlist',    desc: 'Nine Python repos scored on semantic fit, popularity and whether they can actually run' },
+          { icon: '🌳', title: 'Structural analysis', desc: 'Code tree, call graph, dependency graph and the full file listing, built from the clone' },
+          { icon: '🤖', title: 'Autonomous execution', desc: 'Installs, runs, reads the traceback, patches the files and retries until it passes' },
         ].map(c => (
-          <div key={c.title} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '14px 16px' }}>
-            <div style={{ fontSize: 22, marginBottom: 6 }}>{c.icon}</div>
-            <div style={{ fontWeight: 500, fontSize: 13, marginBottom: 4 }}>{c.title}</div>
-            <div style={{ fontSize: 12, color: 'var(--txt2)', lineHeight: 1.5 }}>{c.desc}</div>
+          <div key={c.title} className="lp-feat" style={{ padding: '16px 18px' }}>
+            <div style={{ fontSize: 20, marginBottom: 8 }}>{c.icon}</div>
+            <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 5 }}>{c.title}</div>
+            <div style={{ fontSize: 12, color: 'var(--txt2)', lineHeight: 1.55 }}>{c.desc}</div>
           </div>
         ))}
       </div>
@@ -247,8 +253,9 @@ export default function SearchPage({ task, setTask, setRepos, setSuggestions, se
 function Btn({ children, onClick, disabled, primary }) {
   return (
     <button onClick={onClick} disabled={disabled} style={{
-      padding: '9px 16px', border: `1px solid ${primary ? 'transparent' : 'var(--border2)'}`,
-      borderRadius: 'var(--radius)', background: primary ? 'var(--accent)' : 'transparent',
+      padding: '12px 20px', border: `1px solid ${primary ? 'transparent' : 'var(--border2)'}`,
+      borderRadius: 'var(--radius)', background: primary ? 'var(--grad)' : 'transparent',
+      boxShadow: primary && !disabled ? '0 6px 20px -8px rgba(93,142,255,0.7)' : 'none',
       color: primary ? 'white' : 'var(--txt)', fontFamily: 'var(--font)', fontSize: 13,
       fontWeight: 500, cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.6 : 1,
       display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap',

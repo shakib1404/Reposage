@@ -5,6 +5,8 @@ import GraphCanvas from '../components/GraphCanvas'
 import ClusterView from '../components/ClusterView'
 import ScoreBar from '../components/ScoreBar'
 import TreeView from '../components/TreeView'
+import FileTree from '../components/FileTree'
+import MiniMarkdown from '../components/MiniMarkdown'
 
 // ── Graph descriptions shown in the header badge ─────────────────────────────
 const GRAPH_META = {
@@ -26,11 +28,17 @@ const GRAPH_META = {
     color: '#60a5fa',
     desc:  'Import-level edges between modules. In-degree ↑ = higher reuse. Used for PageRank scoring.',
   },
+  files: {
+    label: 'FILES',
+    title: 'Repository files',
+    color: '#f59e0b',
+    desc:  'Every file in the repo, exactly as github.com lists it — not just the parsed Python modules the HCT shows.',
+  },
 }
 
 // ── Full-screen modal ─────────────────────────────────────────────────────────
-function GraphModal({ graphKey, analysis, onClose }) {
-  const { modules = [], classes = [], fcg_edges = [], mdg_edges = [] } = analysis
+function GraphModal({ graphKey, analysis, onClose, repoFullName = '' }) {
+  const { modules = [], classes = [], fcg_edges = [], mdg_edges = [], file_tree = null } = analysis
   const meta = GRAPH_META[graphKey]
   const [expandedClasses, setExpandedClasses] = useState(new Set())
 
@@ -88,6 +96,11 @@ function GraphModal({ graphKey, analysis, onClose }) {
             {modules.length} modules · {classes.length} classes
           </span>
         )}
+        {graphKey === 'files' && (
+          <span style={{ fontSize: 11, color: 'var(--txt3)' }}>
+            {(file_tree?.total ?? 0)} files
+          </span>
+        )}
 
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button
@@ -107,6 +120,11 @@ function GraphModal({ graphKey, analysis, onClose }) {
 
       {/* Modal content */}
       <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
+        {graphKey === 'files' && (
+          <div style={{ height: '100%', padding: '16px 24px', overflow: 'hidden' }}>
+            <FileTree fileTree={file_tree} repoFullName={repoFullName} height="auto" fullscreen />
+          </div>
+        )}
         {graphKey === 'hct' && (
           <div style={{ height: '100%', padding: '16px 24px', overflowY: 'auto' }}>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, height: '100%' }}>
@@ -192,7 +210,7 @@ function GraphModal({ graphKey, analysis, onClose }) {
 }
 
 // ── Expandable card ───────────────────────────────────────────────────────────
-function ExpandableCard({ graphKey, children }) {
+function ExpandableCard({ graphKey, children, repoFullName = '' }) {
   const [expanded, setExpanded] = useState(false)
   const meta = GRAPH_META[graphKey]
 
@@ -238,7 +256,12 @@ function ExpandableCard({ graphKey, children }) {
       </div>
 
       {expanded && (
-        <GraphModal graphKey={graphKey} analysis={window.__rm_analysis__} onClose={() => setExpanded(false)} />
+        <GraphModal
+          graphKey={graphKey}
+          analysis={window.__rm_analysis__}
+          repoFullName={repoFullName}
+          onClose={() => setExpanded(false)}
+        />
       )}
     </>
   )
@@ -470,9 +493,14 @@ function ChatPanel({ repo, analysis, history, setHistory, onClose, ragStatus, bu
               border: msg.role === 'assistant' ? '1px solid var(--border)' : 'none',
               color: msg.role === 'user' ? 'white' : 'var(--txt)',
               fontSize: 12, lineHeight: 1.65,
-              whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+              // The user's own text is literal; the model answers in Markdown
+              // and used to render with its `**`, backticks and ``` showing.
+              whiteSpace: msg.role === 'user' ? 'pre-wrap' : 'normal',
+              wordBreak: 'break-word',
             }}>
-              {msg.content}
+              {msg.role === 'user'
+                ? msg.content
+                : <MiniMarkdown text={msg.content} />}
             </div>
           </div>
         ))}
@@ -669,6 +697,7 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
     modules = [], classes = [], fcg_edges = [], mdg_edges = [],
     core_components = [], core_scores = [], metrics = {},
     task_plan = [], readme_summary = '', key_files = [],
+    file_tree = null,
   } = analysis
 
   return (
@@ -745,12 +774,27 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
         <ClusterView modules={modules} fcgEdges={fcg_edges} coreComponents={core_components} />
       ) : (
         <>
-          {/* ── Row 1: HCT + Scores ──────────────────────────────────────── */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+          {/* ── Row 1: HCT + Files + Scores ──────────────────────────────── */}
+          {/* auto-fit rather than a fixed 3 columns so the three cards drop to
+              two, then one, on narrower viewports instead of overflowing. */}
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+            gap: 12, marginBottom: 12,
+          }}>
 
             {/* HCT */}
             <ExpandableCard graphKey="hct">
               <TreeView modules={modules} classes={classes} height={220} />
+            </ExpandableCard>
+
+            {/* Repository files — the real listing, as GitHub shows it */}
+            <ExpandableCard graphKey="files" repoFullName={selectedRepo?.full_name || ''}>
+              <FileTree
+                fileTree={file_tree}
+                repoFullName={selectedRepo?.full_name || ''}
+                height={220}
+              />
             </ExpandableCard>
 
             {/* Module scores */}
