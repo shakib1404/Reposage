@@ -2263,6 +2263,20 @@ def _build_run_command(
             )
             return cmd, "Docker (Dockerfile)"
 
+        # A Dockerfile/compose file is here but no docker binary is. Every
+        # branch above is gated on shutil.which("docker"), so we silently fell
+        # through to the venv path and the repo's own documented way of running
+        # itself was ignored without a word. Say so — "it didn't use my
+        # Dockerfile" is otherwise indistinguishable from a bug.
+        _docker_skipped = (
+            "docker-compose.yml" if has_compose else "Dockerfile"
+        )
+        log.warning(
+            "%s found but no docker binary is available in this container — "
+            "falling back to a virtualenv run. See DEPLOY.md to enable Docker "
+            "builds.", _docker_skipped
+        )
+
     # 2. README primary command
     readme_primary = readme_cmds.get("primary_cmd", "").strip()
     if readme_primary and _is_valid_shell_cmd(readme_primary):

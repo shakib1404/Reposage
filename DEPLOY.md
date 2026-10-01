@@ -164,19 +164,80 @@ Everything lives in `.env` (never committed — `.gitignore` already blocks it).
 
 ## 6. Deploy
 
+Two ways. Pick **6B** unless the server has 4GB or more.
+
+### 6A. Build on the server
+
+Needs real headroom: the backend image installs torch and bakes two
+sentence-transformers models, so the *build* peaks well above what the
+finished container uses. On 1–2GB the build itself gets OOM-killed long
+before the app would.
+
 ```bash
 docker compose up -d --build     # first build ~5 min (torch + models)
 docker compose logs -f           # watch it come up
 ```
-
-Wait for `Search reranker warmed up` followed by `Application startup complete`,
-then open the VM's public IP (or your domain) in a browser.
 
 Updating later:
 
 ```bash
 git pull && docker compose up -d --build
 ```
+
+### 6B. Pull pre-built images from Docker Hub (recommended for small VMs)
+
+Build on your own machine, push once, and let the server only download. The
+server then needs just three files: `docker-compose.hub.yml`, `.env`, and —
+if you use step 8 — `repo-task executor/.env`. No source checkout, no build.
+
+**On your machine**, after `docker compose build`:
+
+```bash
+docker login                                   # use an access token, not your password
+docker tag reposage-backend:latest YOURNAME/reposage-backend:v1
+docker tag reposage-web:latest     YOURNAME/reposage-web:v1
+docker push YOURNAME/reposage-backend:v1
+docker push YOURNAME/reposage-web:v1
+```
+
+**On the server**, with `DOCKERHUB_USER` and `TAG` set in `.env`:
+
+```bash
+docker compose -f docker-compose.hub.yml up -d
+
+# on a 2GB VM, layer the low-memory override on as well:
+docker compose -f docker-compose.hub.yml -f docker-compose.lowmem.yml up -d
+```
+
+Updating later is a new tag plus:
+
+```bash
+docker compose -f docker-compose.hub.yml up -d
+```
+
+Pin `TAG` to a version rather than tracking `latest`, so a bad push does not
+roll itself out on the next restart.
+
+**Before publishing an image, confirm no secrets went into it.** The
+`**/.env` rule in `.dockerignore` is what keeps them out, and a bare `.env`
+pattern silently does not — it matches only the context root, which is how
+`repo-task executor/.env` once ended up baked into a layer:
+
+```bash
+docker run --rm --entrypoint sh YOURNAME/reposage-backend:v1 -c \
+  'find / -name ".env*" 2>/dev/null | grep -v ^/proc'        # expect nothing
+docker history --no-trunc YOURNAME/reposage-backend:v1 | grep -iE 'API_KEY=|TOKEN=|SECRET='
+```
+
+A public Docker Hub repo is readable by anyone, image layers included. On the
+free plan you get unlimited public repos but only **one** private repo — not
+enough for both images.
+
+---
+
+Either way: wait for `Search reranker warmed up` followed by
+`Application startup complete`, then open the VM's public IP (or your domain)
+in a browser.
 
 ---
 

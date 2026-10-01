@@ -1,0 +1,67 @@
+# Run RepoSage from pre-built Docker Hub images instead of building locally.
+#
+#   docker compose -f docker-compose.hub.yml up -d
+#
+# This is the file to put on the server. Building on the server is the thing
+# to avoid: the backend image installs torch and bakes two sentence-transformers
+# models, which needs far more RAM and disk than a small droplet has — the
+# build itself OOMs on 1GB long before the app would. Build on your own
+# machine, push, and let the server only pull.
+#
+# Required in .env (or the shell) next to this file:
+#   DOCKERHUB_USER=yourdockerhubusername
+# Optional:
+#   TAG=v1          (defaults to "latest")
+#   SITE_ADDRESS=:80 or your domain, for TLS
+#
+# Everything else — mem limits, tmpfs, volumes — matches docker-compose.yml.
+# On a 2GB host, layer the low-memory override on top of this one as well:
+#   docker compose -f docker-compose.hub.yml -f docker-compose.lowmem.yml up -d
+
+services:
+  backend:
+    image: ${DOCKERHUB_USER:?set DOCKERHUB_USER in .env}/reposage-backend:${TAG:-latest}
+    pull_policy: always
+    env_file:
+      - .env
+      # Keys are read from the host at RUN time and are deliberately NOT in
+      # the image — verified before publishing. The server needs its own copy
+      # of these files; they are not in git and not in the image.
+      - path: "repo-task executor/.env"
+        required: false
+    environment:
+      EXECUTOR_OUTPUT_ROOT: /data/outputs
+      REPO_TASK_WORKSPACE_ROOT: /data/outputs/taskexec
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-}
+    volumes:
+      - outputs:/data/outputs
+    restart: unless-stopped
+
+    # This container executes code from arbitrary public repositories; these
+    # limits are what keeps a hostile or runaway repo from taking the host
+    # down with it. See docker-compose.yml for the reasoning behind each.
+    mem_limit: 3g
+    pids_limit: 512
+    cpus: 1.5
+    tmpfs:
+      - /tmp:size=6g
+
+  web:
+    image: ${DOCKERHUB_USER:?set DOCKERHUB_USER in .env}/reposage-web:${TAG:-latest}
+    pull_policy: always
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  outputs:
+  caddy_data:
+  caddy_config:

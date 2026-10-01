@@ -2,33 +2,112 @@
 
 Autonomous repository exploration & task execution agent.
 
+Describe a task in plain English. RepoSage searches GitHub for a project that
+solves it, ranks the candidates by whether they will actually *run*, maps the
+codebase, then executes it in a sandbox — fixing its own failures until it works.
+
 ## What it does
-1. **Find repos** – Enter a natural-language task; it searches GitHub for the top 3 relevant repos
-2. **Select repo** – Pick the best match
-3. **Analyze** – Builds HCT (Hierarchical Code Tree), FCG (Function Call Graph), MDG (Module Dependency Graph), scores every module
-4. **Execute** – Autonomous explore→write→run→debug loop using Groq LLM
-5. **Output** – View results and full analysis dashboard
 
-## Stack
-- **Frontend**: React + Vite + Recharts + D3
-- **Backend**: FastAPI (Python)
-- **LLMs**: Groq (`GROQ_MODEL` for chat tasks, `GROQ_CLASSIFIER_MODEL` for single-message classification) for repo ranking, analysis, and execution loop. Default chat model: `llama-3.3-70b-versatile`.
-- **Search**: Serper API (GitHub search), Jina AI (content fetch)
+| Step | |
+|---|---|
+| 1. **Find repos** | Plain-English task; an LLM normalises it into a search query |
+| 2. **Select repo** | 9 Python candidates scored on semantic fit, popularity and **runnability** (dependency manifests, entrypoints, Docker support, commit recency) |
+| 3. **Analyze** | Clone + AST parse → Hierarchical Code Tree, Function Call Graph, Module Dependency Graph, and a file listing that matches github.com exactly |
+| 4. **Architecture** | Mermaid architecture diagram generated from the real import graph |
+| 5. **Execute** | Installs deps and runs the entrypoint; on failure the traceback goes back to the model, which rewrites files and retries |
+| 6. **Output** | Streamed logs, exit code, downloadable artifacts |
+| 7. **Audit** | Lint, security, CVEs, types, secrets, dead code, patterns → letter grade + 2 PDF reports |
+| 8. **RepoTask Exec** | Point any repo at a new task; the agent fixes it, runs the tests, and **opens a pull request** |
 
-## Setup
+Plus a **Copy Detector** (structural similarity between repos), **codebase chat**
+(RAG over the clone), and **History** (reopen any past run with its graphs intact).
 
-### 1. Get API keys
-- Groq: https://console.groq.com (free)
-- Serper: https://serper.dev (free tier: 2500 queries)
-- Jina: https://jina.ai (free tier)
+> ⚠️ **RepoSage runs third-party code on purpose.** Runs are confined to a
+> throw-away workspace with capped memory, CPU and process count, but this is
+> not a hardened multi-tenant sandbox. Run it on infrastructure you are willing
+> to lose, and keep registration closed to people you trust.
 
-### 2. Configure
+---
+
+## Quick start — Docker Hub (no build, no checkout)
+
+The published images already contain everything, including the two
+sentence-transformers models. This is the fastest path and the only practical
+one on a small VM: *building* the backend needs far more RAM than running it.
+
 ```bash
-cp .env.example .env
-# Edit .env with your API keys
+# 1. Get the two compose files and the env template
+curl -O https://raw.githubusercontent.com/shakib1404/Reposage/master/docker-compose.hub.yml
+curl -O https://raw.githubusercontent.com/shakib1404/Reposage/master/docker-compose.lowmem.yml
+curl -o .env https://raw.githubusercontent.com/shakib1404/Reposage/master/deploy.env.example
+
+# 2. Fill in .env — at minimum MONGO_URL, JWT_SECRET, GROQ_API_KEY_1
+nano .env
+echo "DOCKERHUB_USER=shakib1404" >> .env
+echo "TAG=v1"                    >> .env
+
+# 3. Run
+docker compose -f docker-compose.hub.yml up -d
+
+# …or on a 2GB host, layer the low-memory override on top:
+docker compose -f docker-compose.hub.yml -f docker-compose.lowmem.yml up -d
+
+docker compose -f docker-compose.hub.yml logs -f
 ```
 
-### 3. Install & run
+Wait for `Search reranker warmed up` then `Application startup complete`, and
+open **http://localhost** (or the server's IP).
+
+**Published images**
+
+| Image | Size (compressed) |
+|---|---|
+| [`shakib1404/reposage-backend`](https://hub.docker.com/r/shakib1404/reposage-backend) `:v1` `:latest` | ~790 MB |
+| [`shakib1404/reposage-web`](https://hub.docker.com/r/shakib1404/reposage-web) `:v1` `:latest` | ~24 MB |
+
+Pin `TAG` to a version rather than tracking `latest`, so a bad push does not
+roll itself out on your next restart.
+
+### Build it yourself instead
+
+```bash
+git clone https://github.com/shakib1404/Reposage.git
+cd Reposage
+cp deploy.env.example .env && nano .env
+docker compose up -d --build        # ~5 min; needs ≥4GB RAM for the build
+```
+
+Full server setup — VM sizing, swap, firewall, TLS, publishing your own
+images — is in **[DEPLOY.md](DEPLOY.md)**.
+
+---
+
+## Configuration
+
+Everything lives in `.env` next to the compose file. Minimum to boot:
+
+| Key | Notes |
+|---|---|
+| `MONGO_URL` | MongoDB Atlas; the free M0 tier is enough |
+| `JWT_SECRET` | `openssl rand -hex 32` |
+| `GROQ_API_KEY_1` | https://console.groq.com (free). `_2.._4` are rate-limit fallbacks |
+| `SITE_ADDRESS` | `:80`, or a domain — Caddy then issues a Let's Encrypt cert itself |
+
+Optional:
+
+| Key | Enables |
+|---|---|
+| `GITHUB_TOKEN` | Lifts the GitHub API limit from 60 to 5000 req/h. **Search needs no scopes; step 8's push + PR needs the `repo` scope.** |
+| `SERPER_API_KEY`, `JINA_API_KEY` | Extra repo-search sources |
+| `ANTHROPIC_API_KEY`, `CLAUDE_MODEL` | Step 8 (RepoTask Exec) — it drives Claude directly, not Groq |
+| `GMAIL_USER`, `GMAIL_PASS` | Password-reset email |
+
+`.env` files are never copied into the image — they are read at run time.
+
+---
+
+## Local development
+
 ```bash
 # Backend
 cd backend
@@ -41,34 +120,55 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173
+Open http://localhost:5173.
 
-## Architecture
+To develop the UI against a backend that is already running in Docker (its port
+is internal, so requests go in through Caddy):
+
+```bash
+VITE_API_TARGET=http://127.0.0.1:80 npm run dev
+```
+
+## Stack
+
+- **Frontend** — React + Vite, Recharts, Mermaid, jsPDF
+- **Backend** — FastAPI (Python 3.13), MongoDB Atlas
+- **LLMs** — Groq (`openai/gpt-oss-120b`) for ranking, analysis and the execution
+  loop; Anthropic Claude for the RepoTask Executor
+- **Retrieval** — sentence-transformers bi-encoder + cross-encoder reranking,
+  CPU-only torch
+- **Serving** — Caddy (static SPA + `/api` reverse proxy with SSE flushing)
+
+## Layout
 
 ```
-reposage/
-├── frontend/          # React + Vite UI
+Reposage/                       # repo root
+├── frontend/                   # React + Vite UI
 │   └── src/
-│       ├── App.jsx
-│       ├── pages/
-│       │   ├── SearchPage.jsx
-│       │   ├── SelectPage.jsx
-│       │   ├── AnalyzePage.jsx
-│       │   ├── ExecutePage.jsx
-│       │   └── OutputPage.jsx
-│       ├── components/
-│       │   ├── TreeView.jsx
-│       │   ├── GraphCanvas.jsx
-│       │   ├── ClusterView.jsx
-│       │   ├── LoopFeed.jsx
-│       │   └── ScoreBar.jsx
-│       └── api.js
-├── backend/           # FastAPI
-│   ├── main.py
-│   ├── search.py      # Serper + Jina search
-│   ├── analyzer.py    # Repo analysis & scoring
-│   ├── executor.py    # LLM execution loop
-│   └── requirements.txt
-├── .env.example
-└── README.md
+│       ├── App.jsx             # step router, auth gate, history persistence
+│       ├── pages/              # LandingPage, Search, Select, Analyze,
+│       │                       # Architect, Execute, Output, Test, TaskExec,
+│       │                       # CopyDetect, History
+│       └── components/         # AuthCard, TreeView, FileTree, GraphCanvas,
+│                               # ClusterView, LoopFeed, ScoreBar, MiniMarkdown
+├── backend/                    # FastAPI
+│   ├── main.py                 # routes + SSE streams
+│   ├── auth.py / history_db.py # accounts, saved runs
+│   ├── search.py               # retrieve → rerank → runnability probe
+│   ├── analyzer.py             # HCT / FCG / MDG, metrics, file tree
+│   ├── architect.py            # Mermaid architecture generation
+│   ├── executor.py             # self-healing execute loop
+│   ├── tester.py / autofix.py  # audit scanners, Semgrep autofix
+│   ├── chat.py / rag.py        # codebase chat
+│   ├── dupdetect.py / corpus.py / copydetector/
+│   └── llm.py                  # Groq client, key rotation, token-budget guard
+├── repo-task executor/         # step 8 — separate Claude-driven agent
+│   ├── run_task.py             # entry point the backend subprocesses
+│   └── agent/                  # cloner, reader, writer, tester, github_pr
+├── docker/                     # Dockerfile.backend, Dockerfile.web, Caddyfile
+├── docker-compose.yml          # build locally
+├── docker-compose.hub.yml      # pull published images
+├── docker-compose.lowmem.yml   # 2GB-host override
+├── deploy.env.example
+└── DEPLOY.md
 ```
