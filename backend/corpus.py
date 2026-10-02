@@ -31,7 +31,12 @@ from dupdetect import SKIP_DIRS, _extract_functions, _get_embedder
 
 log = logging.getLogger(__name__)
 
-CORPUS_ROOT = Path.home() / ".repomaster" / "corpus"
+# The corpus is expensive to build — every indexed repo is cloned, parsed and
+# embedded — so it must outlive the container. The default is the user's home,
+# which inside Docker is image-local and silently wiped on every restart or
+# redeploy; CORPUS_ROOT points it at the persisted outputs volume instead.
+CORPUS_ROOT = Path(os.environ.get("CORPUS_ROOT")
+                   or Path.home() / ".repomaster" / "corpus")
 INDEX_PATH  = CORPUS_ROOT / "index.faiss"
 META_PATH   = CORPUS_ROOT / "metadata.json"
 REPOS_PATH  = CORPUS_ROOT / "repos.json"

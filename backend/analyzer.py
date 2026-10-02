@@ -77,8 +77,13 @@ SKIP_DIRS = {
     "site-packages", "migrations", ".pytest_cache", "htmlcov",
 }
 MAX_FILE_LINES = 3000
-MAX_PY_FILES = 120       # raised — no silent truncation of edges
-MAX_NB_FILES = 30
+# Hard caps on how much of a repo gets parsed. These bound analysis time and
+# the size of the payload that is streamed to the browser and written into
+# every history document — not correctness. Past the cap files are dropped
+# silently, which shows up as a call graph missing edges it should have, so
+# keep them generous enough that only genuinely large projects truncate.
+MAX_PY_FILES = 500
+MAX_NB_FILES = 60
 
 # Stdlib path detection (mirrors pydeps' PYLIB_PATH)
 import pprint as _pprint
@@ -147,6 +152,13 @@ async def analyze_repo(
         modules = _build_modules(parsed_files, mdg_edges)
         classes = _build_classes(parsed_files)
 
+        clusters = _build_clusters(modules, mdg_edges, fcg_edges)
+        # Stamp the id onto each module so the UI can colour a node without
+        # having to search the cluster list for it.
+        _cluster_of = {n: c["id"] for c in clusters for n in c["modules"]}
+        for m in modules:
+            m["cluster"] = _cluster_of.get(m["name"], 0)
+
         top10 = sorted(modules, key=lambda m: -m["score"])[:10]
         static = {
             "modules":         modules,
@@ -159,6 +171,7 @@ async def analyze_repo(
             "tree":            _collect_file_tree(work_path),
             "file_tree":       _collect_repo_file_tree(work_path),
             "import_cycles":   _find_import_cycles(mdg_edges),
+            "clusters":        clusters,
             "task_plan":       [],
             "readme_summary":  "",
             "entry_point":     "",
@@ -784,8 +797,9 @@ def _build_mdg_ast(parsed_files: list[dict]) -> list[dict]:
 
     for pf in parsed_files:
         src = pf["mod_key"]
+        is_init = os.path.basename(pf.get("path", "")) == "__init__.py"
         for imp in pf["imports"]:
-            targets = _resolve_import_ast(imp, src, all_keys)
+            targets = _resolve_import_ast(imp, src, all_keys, is_init)
             for tgt in targets:
                 if tgt != src:
                     edge_weights[(src, tgt)] += 1
@@ -807,10 +821,20 @@ def _resolve_import_ast(
     imp: dict,
     src_mod: str,
     all_keys: set[str],
+    is_pkg_init: bool = False,
 ) -> list[str]:
     """
     Resolve an ImportInfo to a list of repo-internal mod_keys.
     No short-name guessing — only resolves to keys that actually exist.
+
+    `is_pkg_init` matters: inside a package's __init__.py, a single leading dot
+    means the package ITSELF, not its parent. The module key for
+    `src/requests/__init__.py` is already `src.requests`, so stripping a level
+    for `from .api import get` resolved to `src.api` — which does not exist —
+    and the edge was dropped. Every intra-package dependency declared in an
+    __init__ was invisible: measured on psf/requests, its __init__ re-exports
+    nine submodules and showed outbound=0, which in turn made the public API
+    module look like nothing imported it.
     """
     module = imp["module"]
     names = imp["names"]
@@ -819,9 +843,11 @@ def _resolve_import_ast(
     resolved = set()
 
     if is_rel:
-        # Go up `level` package levels
+        # Go up `level` package levels — but an __init__ IS its package, so
+        # the first dot costs it nothing.
         parts = src_mod.split(".")
-        base_parts = parts[: max(0, len(parts) - level)]
+        effective_level = max(0, level - 1) if is_pkg_init else level
+        base_parts = parts[: max(0, len(parts) - effective_level)]
         if module:
             candidates = [".".join(base_parts + module.split("."))]
         else:
@@ -864,6 +890,122 @@ def _resolve_import_ast(
 # ─────────────────────────────────────────────────────────────────────────────
 #  Step 3c — Import cycle detection via Kosaraju SCC  (from pydeps)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _build_clusters(
+    modules:   list[dict],
+    mdg_edges: list[dict],
+    fcg_edges: list[dict],
+) -> list[dict]:
+    """
+    Partition the modules into communities actually present in the graph.
+
+    The UI used to colour nodes by `index % 8` and label the groups "Core",
+    "Utility", "Data"… — names with no relationship to anything measured, and
+    a grouping that changed meaning if a file was renamed. This computes real
+    communities by greedy modularity maximisation over the module dependency
+    graph (undirected, import counts as weights), falling back to call-graph
+    edges projected onto modules when the MDG is empty.
+
+    Modules nothing imports and that import nothing are genuinely unrelated to
+    the rest, so they are collected into one trailing "isolated" cluster
+    instead of being scattered through the others.
+
+    Returns one record per cluster, ordered largest first, with a stable
+    1-based id so the UI can label them Cluster 1..N.
+    """
+    names = [m["name"] for m in modules]
+    if not names:
+        return []
+
+    by_name = {m["name"]: m for m in modules}
+
+    # Undirected weighted adjacency. MDG first; if the repo has no import
+    # edges at all, fall back to call edges mapped to their owning module.
+    adj: dict[str, dict[str, int]] = {n: {} for n in names}
+
+    def link(a: str, b: str, w: int = 1) -> None:
+        if a == b or a not in adj or b not in adj:
+            return
+        adj[a][b] = adj[a].get(b, 0) + w
+        adj[b][a] = adj[b].get(a, 0) + w
+
+    for e in mdg_edges:
+        link(e.get("from", ""), e.get("to", ""), int(e.get("weight", 1) or 1))
+
+    if not any(adj[n] for n in names):
+        # FCG node ids are function-level; map each onto the module that owns it.
+        owner: dict[str, str] = {}
+        for m in modules:
+            for fn in m.get("functions", []):
+                owner.setdefault(fn, m["name"])
+        for e in fcg_edges:
+            a = owner.get(str(e.get("from", "")).split(".")[-1])
+            b = owner.get(str(e.get("to", "")).split(".")[-1])
+            if a and b:
+                link(a, b, int(e.get("weight", 1) or 1))
+
+    connected = [n for n in names if adj[n]]
+    isolated  = [n for n in names if not adj[n]]
+
+    communities: list[list[str]] = []
+    if connected:
+        try:
+            import networkx as nx
+            from networkx.algorithms.community import greedy_modularity_communities
+            g = nx.Graph()
+            g.add_nodes_from(connected)
+            for a in connected:
+                for b, w in adj[a].items():
+                    if b in adj and adj[b]:
+                        g.add_edge(a, b, weight=w)
+            # Run per connected component: greedy modularity on a disconnected
+            # graph merges unrelated components into arbitrary groups.
+            for comp in nx.connected_components(g):
+                sub = g.subgraph(comp)
+                if sub.number_of_nodes() < 3:
+                    communities.append(sorted(sub.nodes()))
+                    continue
+                for c in greedy_modularity_communities(sub, weight="weight"):
+                    communities.append(sorted(c))
+        except Exception as exc:          # networkx missing or algorithm failure
+            log.warning("Community detection unavailable (%s) — "
+                        "falling back to connected components", exc)
+            seen: set[str] = set()
+            for n in connected:
+                if n in seen:
+                    continue
+                stack, comp = [n], []
+                while stack:
+                    cur = stack.pop()
+                    if cur in seen:
+                        continue
+                    seen.add(cur)
+                    comp.append(cur)
+                    stack.extend(adj[cur].keys())
+                communities.append(sorted(comp))
+
+    communities.sort(key=len, reverse=True)
+    if isolated:
+        communities.append(sorted(isolated))
+
+    out: list[dict] = []
+    for i, members in enumerate(communities, start=1):
+        is_isolated = bool(isolated) and i == len(communities) and members == sorted(isolated)
+        # The anchor is the highest-scoring member — a human-readable hint at
+        # what the cluster is, without pretending to name it.
+        anchor_mod = max(members, key=lambda n: by_name.get(n, {}).get("score", 0))
+        out.append({
+            "id":       i,
+            "label":    f"Cluster {i}",
+            "anchor":   by_name.get(anchor_mod, {}).get("short_name", anchor_mod),
+            "modules":  members,
+            "size":     len(members),
+            "isolated": is_isolated,
+            "cohesion": round(
+                sum(len(adj[n]) for n in members) / max(len(members), 1), 2),
+        })
+    return out
+
 
 def _find_import_cycles(mdg_edges: list[dict]) -> list[list[str]]:
     """

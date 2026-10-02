@@ -13,7 +13,7 @@ codebase, then executes it in a sandbox — fixing its own failures until it wor
 | 1. **Find repos** | Plain-English task; an LLM normalises it into a search query |
 | 2. **Select repo** | 9 Python candidates scored on semantic fit, popularity and **runnability** (dependency manifests, entrypoints, Docker support, commit recency) |
 | 3. **Analyze** | Clone + AST parse → Hierarchical Code Tree, Function Call Graph, Module Dependency Graph, and a file listing that matches github.com exactly |
-| 4. **Architecture** | Mermaid architecture diagram generated from the real import graph |
+| 4. **Architecture** | Three Mermaid diagrams, switchable: **Architecture** (subsystems and boundaries), **Sequence** (one end-to-end runtime flow as a timeline), **Data flow** (where data enters, is transformed, rests and leaves) |
 | 5. **Execute** | Installs deps and runs the entrypoint; on failure the traceback goes back to the model, which rewrites files and retries |
 | 6. **Output** | Streamed logs, exit code, downloadable artifacts |
 | 7. **Audit** | Lint, security, CVEs, types, secrets, dead code, patterns → letter grade + 2 PDF reports |
@@ -97,6 +97,7 @@ Optional:
 
 | Key | Enables |
 |---|---|
+| `GROQ_MODEL`, `GROQ_MODELS` | Groq meters tokens **per model**, so when all four keys are out of daily quota the chain switches model and gets a fresh allowance. `GROQ_MODEL` sets the primary; `GROQ_MODELS` (comma-separated) replaces the whole chain. Check ids against `/v1/models` first — most of Groq's catalogue 404s on the free tier |
 | `GITHUB_TOKEN` | Lifts the GitHub API limit from 60 to 5000 req/h. **Search needs no scopes; step 8's push + PR needs the `repo` scope.** |
 | `SERPER_API_KEY`, `JINA_API_KEY` | Extra repo-search sources |
 | `ANTHROPIC_API_KEY`, `CLAUDE_MODEL` | Step 8 (RepoTask Exec) — it drives Claude directly, not Groq |
@@ -133,8 +134,9 @@ VITE_API_TARGET=http://127.0.0.1:80 npm run dev
 
 - **Frontend** — React + Vite, Recharts, Mermaid, jsPDF
 - **Backend** — FastAPI (Python 3.13), MongoDB Atlas
-- **LLMs** — Groq (`openai/gpt-oss-120b`) for ranking, analysis and the execution
-  loop; Anthropic Claude for the RepoTask Executor
+- **LLMs** — Groq for ranking, analysis and the execution loop, over 4 API keys ×
+  a chain of models (`gpt-oss-120b` → `gpt-oss-20b` → `qwen3.8-27b` →
+  `gpt-oss-safeguard-20b`); Anthropic Claude for the RepoTask Executor
 - **Retrieval** — sentence-transformers bi-encoder + cross-encoder reranking,
   CPU-only torch
 - **Serving** — Caddy (static SPA + `/api` reverse proxy with SSE flushing)
@@ -156,9 +158,9 @@ Reposage/                       # repo root
 │   ├── auth.py / history_db.py # accounts, saved runs
 │   ├── search.py               # retrieve → rerank → runnability probe
 │   ├── analyzer.py             # HCT / FCG / MDG, metrics, file tree
-│   ├── architect.py            # Mermaid architecture generation
+│   ├── architect.py            # Mermaid architecture / sequence / dataflow diagrams
 │   ├── executor.py             # self-healing execute loop
-│   ├── tester.py / autofix.py  # audit scanners, Semgrep autofix
+│   ├── tester.py              # audit scanners (9 engines)
 │   ├── chat.py / rag.py        # codebase chat
 │   ├── dupdetect.py / corpus.py / copydetector/
 │   └── llm.py                  # Groq client, key rotation, token-budget guard

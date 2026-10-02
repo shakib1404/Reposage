@@ -168,9 +168,13 @@ export default function OutputPage({ task, selectedRepo, analysis, execResult, u
   const otherFiles = files.filter(
     f => !IMAGE_EXTS.has(ext(f.name)) && f.name !== 'run_final.sh')
   // run_final.sh has its own card above, so it is filtered out of the list.
-  // Count what is actually listed — using files.length made the header read
-  // "Output files (3)" above two rows.
-  const shownCount = imageFiles.length + otherFiles.length
+  // Count what is actually listed under THIS heading: images are hoisted into
+  // their own card higher up, so including them made the header read
+  // "Output files (3)" above two rows the moment a run produced an image.
+  // shownCount stays the total — it decides whether there is anything at all
+  // to show, and "no output files yet" would be wrong when an image exists.
+  const listedCount = otherFiles.length
+  const shownCount  = imageFiles.length + otherFiles.length
 
   function fetchPreview(jid, name) {
     setPreviewError('')
@@ -417,7 +421,7 @@ export default function OutputPage({ task, selectedRepo, analysis, execResult, u
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
           <SectionLabel>
             Output files
-            {loading ? ' (loading…)' : ` (${shownCount})`}
+            {loading ? ' (loading…)' : ` (${listedCount})`}
           </SectionLabel>
           <div style={{ flex: 1 }} />
           {jobId && (

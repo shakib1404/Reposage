@@ -13,7 +13,7 @@ serverless platforms entirely, and it makes the security section non-optional.
 | **Azure VM** (Azure for Students) | ✅ recommended | $100 credit / 12 months, no credit card. See §2 |
 | **Oracle Cloud Always Free** | ✅ best long-term | 4 ARM cores / 24GB **free forever**; signup capacity can be flaky |
 | Hetzner / Linode / any VPS | ✅ | ~€4-6/mo for the same specs |
-| DigitalOcean droplet | ⚠️ | The student credit is now $5, not $200 — about a month on the smallest (512MB) droplet, which can't run this |
+| DigitalOcean droplet | ✅ | Fine on a 2GB droplet (~$12/mo). Check the student credit first — it has been $200 and $5 at different times. See §2C |
 | Fly.io / Railway | ⚠️ | Works, but needs a paid tier for enough RAM |
 | Render free tier | ❌ | 512MB RAM — torch alone won't fit |
 | Vercel / Netlify / Cloudflare Workers / Lambda | ❌ | No subprocess, no persistent FS, request timeouts far below a 200s execution, and SSE doesn't survive |
@@ -99,6 +99,42 @@ its own after a start — nothing to re-run manually.
 
 ---
 
+## 2C. DigitalOcean, step by step
+
+**Check your credit first.** The GitHub Student pack's DigitalOcean offer has
+been $200/12 months at times and $5 at others. $200 comfortably covers a 2GB
+droplet for the year; $5 buys about twelve days of one. Look at
+`education.github.com/pack` before paying out of pocket — and compare with
+Azure for Students (§2), which has been the better free option.
+
+**Create the droplet** — Create → Droplets:
+
+| Field | Value |
+|---|---|
+| Region | nearest to you |
+| Image | Ubuntu 24.04 LTS |
+| Type | Basic → Regular (SSD) |
+| Size | **2GB / 1 vCPU / 50GB** (~$12/mo). 1GB/$6 is possible with 4GB swap and the lowmem override; 512MB/$4 is **not** — peak usage is ~621MB |
+| Authentication | **SSH key**, not password |
+| Hostname | reposage |
+
+The 512MB droplet also fails on disk: 10GB does not hold a 3.3GB image plus
+Docker's layer cache plus cloned repos.
+
+**Point DNS (optional).** For HTTPS, add an `A` record for your domain to the
+droplet's IP *before* starting the stack — Caddy requests the certificate on
+first boot, and the request fails if the name doesn't resolve yet.
+
+**Firewall.** DigitalOcean's cloud firewall (Networking → Firewalls) is
+separate from `ufw`; if you create one, allow 22, 80 and 443 inbound. §3's
+`ufw` rules are still worth setting as a second layer.
+
+Then continue with §3 below — the server setup is the same everywhere. On a
+2GB droplet use §4's low-memory override, and prefer §6B (pull pre-built
+images) over building on the droplet.
+
+---
+
 ## 3. One-time setup on the server
 
 Ubuntu 24.04, as root:
@@ -115,7 +151,7 @@ echo '/swapfile none swap sw 0 0' >> /etc/fstab
 ufw allow OpenSSH && ufw allow 80 && ufw allow 443 && ufw --force enable
 
 git clone https://github.com/shakib1404/Reposage.git
-cd Reposage/reposage
+cd Reposage                 # the repo root IS the app dir — no nested folder
 cp deploy.env.example .env
 nano .env          # fill in the values — see §5
 ```

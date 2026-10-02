@@ -14,6 +14,9 @@ services:
         required: false
     environment:
       EXECUTOR_OUTPUT_ROOT: /data/outputs
+      # Copy Detector corpus (faiss index + metadata). Must live on the volume:
+      # its default is $HOME inside the image, which a restart throws away.
+      CORPUS_ROOT: /data/outputs/corpus
       # Where RepoTask Executor clones repos. Must be writable and is
       # deliberately on the outputs volume, not in the read-only /opt package.
       REPO_TASK_WORKSPACE_ROOT: /data/outputs/taskexec
@@ -41,8 +44,16 @@ services:
     # keeps that churn off the droplet's disk, and the size cap means a repo
     # with enormous dependencies fails its own install rather than filling
     # the filesystem. Raise if you audit genuinely large projects.
+    #
+    # `exec` is REQUIRED and is not the default: Docker mounts tmpfs
+    # noexec,nosuid,nodev. A venv built here is useless under noexec — its
+    # bin/ scripts cannot run — and the audit silently reported "0 findings,
+    # Grade A" for every repo because ruff, bandit, mypy and the rest could
+    # never start. The executor happened to survive only because it invokes
+    # `python -m pip` through the system interpreter rather than the venv's
+    # own entry points.
     tmpfs:
-      - /tmp:size=6g
+      - /tmp:size=6g,exec
 
   web:
     build:

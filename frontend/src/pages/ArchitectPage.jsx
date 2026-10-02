@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import mermaid from 'mermaid'
-import { streamArchitect } from '../api'
+import { streamArchitect, getArchitectKinds } from '../api'
 import MiniMarkdown from '../components/MiniMarkdown'
 
 // ── Mermaid initialisation ────────────────────────────────────────────────────
@@ -9,6 +9,16 @@ mermaid.initialize({
   theme:        'dark',
   darkMode:     true,
   flowchart:    { curve: 'basis', useMaxWidth: true },
+  // Sequence diagrams are a different renderer with its own defaults; without
+  // this they come out cramped and ignore the dark theme's spacing.
+  sequence: {
+    useMaxWidth:    true,
+    showSequenceNumbers: true,
+    actorMargin:    40,
+    boxMargin:      10,
+    mirrorActors:   false,
+    wrap:           true,
+  },
   themeVariables: {
     background:        '#0d1117',
     mainBkg:           '#161b22',
@@ -17,8 +27,34 @@ mermaid.initialize({
     titleColor:        '#e6edf3',
     edgeLabelBackground: '#161b22',
     lineColor:         '#8b949e',
+    actorBkg:          '#1e3a5f',
+    actorBorder:       '#3b82f6',
+    actorTextColor:    '#bfdbfe',
+    actorLineColor:    '#8b949e',
+    signalColor:       '#e6edf3',
+    signalTextColor:   '#e6edf3',
+    labelBoxBkgColor:  '#161b22',
+    labelTextColor:    '#e6edf3',
+    noteBkgColor:      '#451a03',
+    noteTextColor:     '#fde68a',
+    noteBorderColor:   '#f59e0b',
+    sequenceNumberColor: '#0d1117',
   },
 })
+
+// ── Diagram kinds ─────────────────────────────────────────────────────────────
+// Mirrors DIAGRAM_KINDS in backend/architect.py. The backend is still the
+// authority — /api/architect/kinds is fetched on mount and replaces this list
+// if they ever drift.
+const DEFAULT_TABS = [
+  { id: 'architecture', label: 'Architecture', icon: '🏗',
+    blurb: 'Subsystems, their responsibilities and the boundaries between them.' },
+  { id: 'sequence',     label: 'Sequence',     icon: '⇄',
+    blurb: 'One end-to-end runtime flow in order, as a timeline of calls and replies.' },
+  { id: 'dataflow',     label: 'Data flow',    icon: '🔀',
+    blurb: 'Where data enters, how it is transformed, where it rests and where it leaves.' },
+]
+const TAB_ICON = { architecture: '🏗', sequence: '⇄', dataflow: '🔀' }
 
 // ── Stage metadata ────────────────────────────────────────────────────────────
 const STAGE_ORDER = ['fetching', 'explanation', 'graph', 'compiling', 'done']
@@ -204,7 +240,7 @@ function MermaidDiagram({ code }) {
   )
 }
 
-function ExplanationAccordion({ text }) {
+function ExplanationAccordion({ text, label = 'Architecture' }) {
   const [open, setOpen] = useState(false)
   return (
     <div style={{
@@ -221,7 +257,7 @@ function ExplanationAccordion({ text }) {
           cursor: 'pointer',
         }}
       >
-        <span style={{ fontWeight: 500 }}>Architecture explanation (LLM)</span>
+        <span style={{ fontWeight: 500 }}>{label} explanation (LLM)</span>
         <span style={{ fontSize: 14, transition: 'transform 0.2s', transform: open ? 'rotate(180deg)' : 'none' }}>▾</span>
       </button>
       {open && (
@@ -241,18 +277,32 @@ function ExplanationAccordion({ text }) {
   )
 }
 
-function GraphStats({ graph }) {
-  if (!graph) return null
-  const nodes  = (graph.nodes  || []).length
-  const edges  = (graph.edges  || []).length
-  const groups = (graph.groups || []).length
+// Each kind has a different graph shape, so counting "nodes/edges/groups"
+// would read 0/0/0 for a sequence diagram.
+function statsFor(kind, graph) {
+  if (!graph) return []
+  if (kind === 'sequence') return [
+    { label: 'Participants', value: (graph.participants || []).length },
+    { label: 'Steps',        value: (graph.messages     || []).length },
+  ]
+  if (kind === 'dataflow') return [
+    { label: 'Nodes',  value: (graph.nodes || []).length },
+    { label: 'Flows',  value: (graph.flows || []).length },
+    { label: 'Stores', value: (graph.nodes || []).filter(n => n.kind === 'store').length },
+  ]
+  return [
+    { label: 'Nodes',  value: (graph.nodes  || []).length },
+    { label: 'Edges',  value: (graph.edges  || []).length },
+    { label: 'Groups', value: (graph.groups || []).length },
+  ]
+}
+
+function GraphStats({ graph, kind }) {
+  const items = statsFor(kind, graph)
+  if (!items.length) return null
   return (
     <div style={{ display: 'flex', gap: 12, marginBottom: 12 }}>
-      {[
-        { label: 'Nodes',  value: nodes  },
-        { label: 'Edges',  value: edges  },
-        { label: 'Groups', value: groups },
-      ].map(({ label, value }) => (
+      {items.map(({ label, value }) => (
         <div key={label} style={{
           background: 'var(--bg2)', border: '1px solid var(--border)',
           borderRadius: 'var(--radius)', padding: '7px 16px',
@@ -266,6 +316,42 @@ function GraphStats({ graph }) {
   )
 }
 
+// A DFD's meaning lives in its shapes, and Mermaid draws no key. Rendered in
+// HTML rather than inside the diagram so it cannot break the Mermaid parse.
+function DataflowLegend() {
+  const items = [
+    { shape: 'rect', tone: '#f59e0b', bg: '#451a03', label: 'External', hint: 'source or sink outside the system' },
+    { shape: 'pill', tone: '#3b82f6', bg: '#1e3a5f', label: 'Process',  hint: 'code that transforms data' },
+    { shape: 'cyl',  tone: '#22c55e', bg: '#052e16', label: 'Store',    hint: 'where data comes to rest' },
+  ]
+  return (
+    <div style={{
+      display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'center',
+      padding: '8px 12px', marginBottom: 12,
+      background: 'var(--bg2)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius)', fontSize: 11, color: 'var(--txt2)',
+    }}>
+      <span style={{ color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.06em', fontSize: 10 }}>
+        Shapes
+      </span>
+      {items.map(({ shape, tone, bg, label, hint }) => (
+        <span key={label} title={hint} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{
+            width: 20, height: 12, background: bg, border: `1.5px solid ${tone}`,
+            borderRadius: shape === 'pill' ? 6 : shape === 'cyl' ? '6px / 3px' : 2,
+            flexShrink: 0,
+          }} />
+          <strong style={{ color: 'var(--txt)', fontWeight: 600 }}>{label}</strong>
+          <span style={{ color: 'var(--txt3)' }}>— {hint}</span>
+        </span>
+      ))}
+      <span style={{ marginLeft: 'auto', color: 'var(--txt3)' }}>
+        Arrow labels name the data, not the call.
+      </span>
+    </div>
+  )
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function ArchitectPage({
@@ -275,38 +361,75 @@ export default function ArchitectPage({
   const [stage,      setStage]      = useState('idle')
   const [feedEvents, setFeedEvents] = useState([])
   const [error,      setError]      = useState('')
+  const [kind,       setKind]       = useState('architecture')
+  const [tabs,       setTabs]       = useState(DEFAULT_TABS)
+  // One result per kind, so switching tabs shows what you already generated
+  // instead of throwing it away and charging another LLM round trip.
+  const [byKind,     setByKind]     = useState(() =>
+    architectResult ? { [architectResult.kind || 'architecture']: architectResult } : {})
   const stopRef = useRef(null)
+
+  const result = byKind[kind] || null
+
+  // A restored history entry arrives as a single flat result; file it under
+  // its kind so the tab it belongs to shows it.
+  useEffect(() => {
+    if (!architectResult) return
+    const k = architectResult.kind || 'architecture'
+    setByKind(prev => (prev[k] === architectResult ? prev : { ...prev, [k]: architectResult }))
+  }, [architectResult])
+
+  // The backend owns the list of kinds; never offer one it cannot draw.
+  useEffect(() => {
+    let alive = true
+    getArchitectKinds()
+      .then(data => {
+        if (!alive || !data?.kinds?.length) return
+        setTabs(data.kinds.map(k => ({
+          id: k.id, label: k.label, icon: TAB_ICON[k.id] || '◆', blurb: k.focus,
+        })))
+      })
+      .catch(() => {})   // offline or old backend → keep DEFAULT_TABS
+    return () => { alive = false }
+  }, [])
 
   const addFeed = useCallback((msg, stageKey, type = 'status') => {
     setFeedEvents(prev => [...prev, { message: msg, stage: stageKey, type }])
   }, [])
 
-  const handleGenerate = useCallback(() => {
+  const handleGenerate = useCallback((targetKind = kind) => {
     if (!selectedRepo) return
     setRunning(true)
     setError('')
     setFeedEvents([])
     setStage('fetching')
-    setArchitectResult(null)
+    setKind(targetKind)
+    // Clear only this tab — the other diagrams stay on screen.
+    setByKind(prev => ({ ...prev, [targetKind]: null }))
 
     const stop = streamArchitect(selectedRepo.full_name, (ev) => {
       if (ev.type === 'status') {
         setStage(ev.stage)
         addFeed(ev.message, ev.stage)
       } else if (ev.type === 'explanation') {
-        addFeed('Architecture explanation generated.', 'explanation')
+        addFeed('Explanation generated.', 'explanation')
       } else if (ev.type === 'graph') {
-        addFeed('Architecture graph built.', 'graph')
+        addFeed('Graph built.', 'graph')
       } else if (ev.type === 'done') {
         setStage('done')
         addFeed('Diagram ready!', 'done')
-        setArchitectResult({
+        const built = {
+          kind:        ev.kind || targetKind,
+          kindLabel:   ev.kind_label || '',
           mermaid:     ev.mermaid,
           explanation: ev.explanation,
           graph:       ev.graph,
           branch:      ev.branch,
           tokens:      ev.tokens,
-        })
+          model:       ev.model || '',
+        }
+        setByKind(prev => ({ ...prev, [built.kind]: built }))
+        setArchitectResult(built)
         unlock('execute')
         setRunning(false)
       } else if (ev.type === 'error') {
@@ -315,10 +438,10 @@ export default function ArchitectPage({
         addFeed(ev.message, 'error', 'error')
         setRunning(false)
       }
-    })
+    }, targetKind)
 
     stopRef.current = stop
-  }, [selectedRepo, addFeed, setArchitectResult, unlock])
+  }, [selectedRepo, kind, addFeed, setArchitectResult, unlock])
 
   useEffect(() => {
     return () => {
@@ -341,14 +464,14 @@ export default function ArchitectPage({
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
         <div>
           <h2 style={{ fontSize: 15, fontWeight: 600, margin: 0, letterSpacing: '-0.01em' }}>
-            Architecture Diagram
+            Repository Diagrams
           </h2>
           <p style={{ fontSize: 12, color: 'var(--txt2)', margin: '2px 0 0' }}>
-            {selectedRepo.full_name} — AI-generated Mermaid architecture
+            {selectedRepo.full_name} — AI-generated Mermaid diagrams
           </p>
         </div>
         <div style={{ flex: 1 }} />
-        {architectResult && (
+        {Object.values(byKind).some(Boolean) && (
           <button
             onClick={() => { unlock('execute'); go('execute') }}
             style={{
@@ -362,16 +485,59 @@ export default function ArchitectPage({
         )}
       </div>
 
+      {/* ── Diagram-kind tabs ────────────────────────────────────────── */}
+      <div style={{
+        display: 'flex', gap: 4, marginBottom: 16, padding: 3,
+        background: 'var(--bg2)', borderRadius: 'var(--radius)',
+        border: '1px solid var(--border)',
+      }}>
+        {tabs.map(t => {
+          const active = kind === t.id
+          const ready  = Boolean(byKind[t.id])
+          return (
+            <button
+              key={t.id}
+              onClick={() => !running && setKind(t.id)}
+              disabled={running}
+              title={t.blurb}
+              style={{
+                flex: 1, padding: '8px 6px', fontSize: 12, fontWeight: 500,
+                border: 'none', borderRadius: 6,
+                cursor: running ? 'default' : 'pointer',
+                background: active ? 'var(--accent)' : 'transparent',
+                color:      active ? 'white' : 'var(--txt3)',
+                opacity:    running && !active ? 0.5 : 1,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                transition: 'background 0.15s',
+              }}
+            >
+              <span aria-hidden="true">{t.icon}</span>
+              {t.label}
+              {ready && (
+                <span title="Already generated" style={{
+                  fontSize: 9, color: active ? 'white' : 'var(--green)',
+                  border: `1px solid ${active ? 'rgba(255,255,255,0.5)' : 'var(--green)'}`,
+                  borderRadius: 3, padding: '0 3px', fontWeight: 700,
+                }}>✓</span>
+              )}
+            </button>
+          )
+        })}
+      </div>
+
       {/* ── Generate button or progress ──────────────────────────────── */}
-      {!architectResult && !running && (
+      {!result && !running && (
         <div style={{ textAlign: 'center', padding: '48px 0' }}>
-          <div style={{ fontSize: 48, marginBottom: 16 }}>🏗</div>
-          <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 8 }}>
-            Generate Architecture Diagram
+          <div style={{ fontSize: 48, marginBottom: 16 }}>
+            {tabs.find(t => t.id === kind)?.icon || '🏗'}
           </div>
-          <div style={{ fontSize: 12, color: 'var(--txt2)', marginBottom: 24, maxWidth: 420, margin: '0 auto 24px' }}>
-            RepoSage will fetch the file tree from GitHub, ask the LLM to explain the architecture,
-            then compile it into an interactive Mermaid flowchart.
+          <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 8 }}>
+            Generate {tabs.find(t => t.id === kind)?.label || 'Architecture'} Diagram
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--txt2)', marginBottom: 24, maxWidth: 440, margin: '0 auto 24px' }}>
+            RepoSage fetches the file tree from GitHub, asks the LLM to explain{' '}
+            {tabs.find(t => t.id === kind)?.blurb?.replace(/\.$/, '') || 'the architecture'},
+            then compiles it into an interactive Mermaid diagram.
           </div>
           {error && (
             <div style={{
@@ -384,7 +550,7 @@ export default function ArchitectPage({
             </div>
           )}
           <button
-            onClick={handleGenerate}
+            onClick={() => handleGenerate(kind)}
             style={{
               padding: '10px 28px', background: 'var(--accent)',
               border: 'none', borderRadius: 'var(--radius)',
@@ -420,19 +586,31 @@ export default function ArchitectPage({
       )}
 
       {/* ── Result ───────────────────────────────────────────────────── */}
-      {architectResult && (
+      {result && !running && (
         <div className="fade-in">
           {/* Stats row */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 12 }}>
-            <GraphStats graph={architectResult.graph} />
+            <GraphStats graph={result.graph} kind={kind} />
             <div style={{ flex: 1 }} />
-            {architectResult.tokens > 0 && (
+            {result.model && (
+              <span
+                title={`Drawn by ${result.model}. Keys and models are tried in order, so a quota-exhausted primary falls back to a smaller model.`}
+                style={{
+                  fontSize: 10, color: 'var(--txt3)', padding: '2px 7px',
+                  border: '1px solid var(--border2)', borderRadius: 4,
+                  fontFamily: 'var(--mono, monospace)',
+                }}
+              >
+                {result.model.split('/').pop()}
+              </span>
+            )}
+            {result.tokens > 0 && (
               <span style={{ fontSize: 11, color: 'var(--txt3)' }}>
-                {architectResult.tokens.toLocaleString()} tokens used
+                {result.tokens.toLocaleString()} tokens used
               </span>
             )}
             <button
-              onClick={handleGenerate}
+              onClick={() => handleGenerate(kind)}
               style={{
                 display: 'flex', alignItems: 'center', gap: 5,
                 padding: '5px 12px', fontSize: 11,
@@ -450,6 +628,8 @@ export default function ArchitectPage({
             </button>
           </div>
 
+          {kind === 'dataflow' && <DataflowLegend />}
+
           {/* Diagram */}
           <div style={{
             background: 'var(--bg2)', border: '1px solid var(--border)',
@@ -464,21 +644,26 @@ export default function ArchitectPage({
                 background: 'var(--accent-dim)', border: '1px solid rgba(93,142,255,0.3)',
                 borderRadius: 3, padding: '1px 7px', color: 'var(--accent)',
               }}>
-                Mermaid Flowchart
+                {kind === 'sequence' ? 'Mermaid Sequence' : 'Mermaid Flowchart'}
               </span>
-              <span>Architecture</span>
-              {architectResult.branch && (
+              <span>
+                {result.kindLabel || tabs.find(t => t.id === kind)?.label || 'Architecture'}
+              </span>
+              {result.branch && (
                 <span style={{ color: 'var(--txt3)', fontWeight: 400 }}>
-                  · branch: {architectResult.branch}
+                  · branch: {result.branch}
                 </span>
               )}
             </div>
-            <MermaidDiagram code={architectResult.mermaid} />
+            <MermaidDiagram code={result.mermaid} />
           </div>
 
           {/* Explanation */}
-          {architectResult.explanation && (
-            <ExplanationAccordion text={architectResult.explanation} />
+          {result.explanation && (
+            <ExplanationAccordion
+              text={result.explanation}
+              label={result.kindLabel || tabs.find(t => t.id === kind)?.label || 'Architecture'}
+            />
           )}
         </div>
       )}

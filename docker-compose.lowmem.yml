@@ -19,5 +19,7 @@ services:
     # heavy dependencies will fail their install rather than take the VM down —
     # the right trade at this size. Raise it (or drop the tmpfs line entirely
     # so workspaces build on disk) if you need to analyse larger projects.
+    # `exec` is required — see docker-compose.yml. Without it every venv
+    # built here is inert and the audit reports 0 findings for every repo.
     tmpfs:
-      - /tmp:size=1g
+      - /tmp:size=1g,exec

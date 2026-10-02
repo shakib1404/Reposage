@@ -118,12 +118,39 @@ _UI_SERVER_STARTED = re.compile(
     re.IGNORECASE,
 )
 
+# Desktop GUI toolkits. A program built on one of these behaves like a server
+# and nothing like a script: it opens a window, spins an event loop and never
+# exits on its own, so waiting for an exit code means waiting for the timeout
+# and then calling a perfectly healthy run a failure. Reported by a user whose
+# maze and qrcode repos both "ran" and were marked failed.
+_GUI_TOOLKITS = re.compile(
+    r"^\s*(?:import|from)\s+(tkinter|Tkinter|pygame|PyQt5|PyQt6|PySide2|PySide6"
+    r"|kivy|wx|pyglet|arcade|customtkinter|ttkbootstrap|turtle)\b",
+    re.MULTILINE,
+)
+
+# Evidence in the output that a GUI toolkit actually came up.
+_GUI_STARTED = re.compile(
+    r"pygame community|"                       # pygame's banner
+    r"Hello from the pygame community|"
+    r"initialising display|"
+    r"Initializing (?:display|window)",
+    re.IGNORECASE,
+)
+
 # Regex patterns for automatic error classification
 AUTOFIX_PATTERNS: dict[str, re.Pattern] = {
     "missing_module": re.compile(
         r"ModuleNotFoundError[^\n]*['\"]([a-zA-Z0-9_\-]+)['\"]"),
     "api_change": re.compile(
         r"ImportError: cannot import name ['\"]([a-zA-Z0-9_\-]+)['\"]"),
+    # A library dropped a keyword the repo still passes (e.g. matplotlib 3.3
+    # removed savefig(frameon=)). Must be classified before missing_argument,
+    # whose TypeError branch would otherwise swallow it and send the LLM
+    # hunting for a CLI option that cannot exist.
+    "unexpected_kwarg": re.compile(
+        r"TypeError:[^\n]*(?:unexpected keyword argument|"
+        r"takes no keyword arguments)[^\n]*?['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]"),
     "interactive_prompt": re.compile(
         r"\[y/n\]|\[yes/no\]|\(y\)\s*:|\(n\)\s*:|Are you sure|"
         r"Continue\?|Overwrite\?|Proceed\?|already exists.*\[y",
@@ -505,10 +532,38 @@ async def run_execution_loop(
                   f"$ {run_cmd}",
                   code=run_cmd, tool="cmd.build", metrics=metrics)
 
+        # Snapshot the workspace before anything runs. Whatever appears after
+        # this point was produced BY the run, which is what makes it safe to
+        # sweep the repo for artefacts without dragging in files the project
+        # already shipped.
+        pre_run_files = _snapshot_files(workspace)
+
+        # Does this run drive a desktop GUI? Decided from the source of the
+        # file the run command actually targets, so a repo that merely ships an
+        # unrelated tkinter demo is not misread as a GUI app.
+        is_gui = _targets_gui(run_cmd, workspace)
+        if is_gui:
+            yield _ev("exec", "Desktop GUI detected",
+                      "This entry point drives a GUI event loop, so it will "
+                      "never exit on its own. Rendering headless and treating "
+                      "a stable window as success.",
+                      tool="gui.detect", metrics=metrics)
+
+        # Files the task explicitly asks for. Empty for the many tasks whose
+        # deliverable is stdout, and the artifact gate stays dormant then.
+        expected_artifacts = _expected_artifacts(task)
+        if expected_artifacts:
+            yield _ev("exec", "Expected output file(s)",
+                      ", ".join(expected_artifacts) +
+                      " — exit 0 alone will not be accepted as success.",
+                      tool="artifact.expect", metrics=metrics)
+
         # ── 13. Execution + fix loop ───────────────────────────────────────────
         final_rc     = 1
         final_stdout = ""
         final_stderr = ""
+        unmet        = []
+        install_only = False
         iteration_log: list[dict] = []
 
         for attempt in range(MAX_RETRIES):
@@ -521,17 +576,23 @@ async def run_execution_loop(
                       code=run_cmd, tool="bash.run", metrics=metrics)
 
             final_rc, final_stdout, final_stderr = await _run_direct(
-                run_cmd, workspace, venv_path or "")
+                run_cmd, workspace, venv_path or "",
+                is_gui=_targets_gui(run_cmd, workspace))
 
             elapsed    = round(time.monotonic() - t_attempt, 2)
             run_output = _fmt_output(final_rc, final_stdout, final_stderr)
+            # A GUI or server that was killed after staying up never had the
+            # chance to write a file, so it is exempt from the artifact gate.
+            stayed_up  = ("[RepoSage]" in final_stdout
+                          or bool(_UI_SERVER_STARTED.search(
+                              final_stdout + final_stderr)))
 
             iteration_log.append({
                 "attempt":    attempt + 1,
                 "command":    run_cmd,
                 "returncode": final_rc,
-                "stdout":     final_stdout[:3000],
-                "stderr":     final_stderr[:3000],
+                "stdout":     _clip(final_stdout, 3000, 900),
+                "stderr":     _clip(final_stderr, 3000, 900),
                 "elapsed_s":  elapsed,
             })
 
@@ -541,20 +602,53 @@ async def run_execution_loop(
             if final_rc != 0 and _UI_SERVER_STARTED.search(final_stdout + final_stderr):
                 final_rc = 0
 
-            if final_rc == 0:
+            # Exit 0 is necessary but not sufficient: if the task named a file
+            # and that file does not exist, the task is not done. Feed the gap
+            # back into the retry loop instead of reporting a hollow success.
+            # A GUI or server that merely stayed up is exempt — it was never
+            # going to write anything on its own.
+            unmet = []
+            if final_rc == 0 and expected_artifacts and not stayed_up:
+                unmet = _missing_artifacts(expected_artifacts, workspace,
+                                           pre_run_files)
+            install_only = final_rc == 0 and _is_install_only(run_cmd)
+
+            if final_rc == 0 and not unmet and not install_only:
                 yield _ev("exec",
                           f"✅ Attempt {attempt + 1} succeeded (exit 0)",
                           f"Completed in {elapsed}s.",
-                          code=run_output[:4000],
+                          code=_clip(run_output, 4000, 1200),
                           tool="bash.run", metrics=metrics)
                 break
 
-            error_class = _classify_error(final_stderr + final_stdout)
-            yield _ev("feedback",
-                      f"Attempt {attempt + 1} failed — class: [{error_class}]",
-                      _error_summary(final_stderr, final_stdout),
-                      code=run_output[:3000],
-                      tool="feedback.loop", metrics=metrics)
+            if install_only:
+                error_class = "install_only"
+                gap = ("The command only installed a dependency — it never ran "
+                       "the project, so nothing was demonstrated. Give a "
+                       "revised_command that actually exercises the repo.")
+                run_output = gap + "\n\n" + run_output
+                yield _ev("feedback",
+                          f"Attempt {attempt + 1} only installed dependencies",
+                          gap, code=_clip(run_output, 3000, 900),
+                          tool="feedback.loop", metrics=metrics)
+            elif unmet:
+                error_class = "missing_artifact"
+                gap = ("The command exited 0 but the task's output file(s) were "
+                       f"never created: {', '.join(unmet)}. The run did not "
+                       "actually perform the task.")
+                run_output = gap + "\n\n" + run_output
+                yield _ev("feedback",
+                          f"Attempt {attempt + 1} exited 0 but produced no output file",
+                          gap,
+                          code=_clip(run_output, 3000, 900),
+                          tool="feedback.loop", metrics=metrics)
+            else:
+                error_class = _classify_error(final_stderr + final_stdout)
+                yield _ev("feedback",
+                          f"Attempt {attempt + 1} failed — class: [{error_class}]",
+                          _error_summary(final_stderr, final_stdout),
+                          code=_clip(run_output, 3000, 900),
+                          tool="feedback.loop", metrics=metrics)
 
             if attempt >= MAX_RETRIES - 1:
                 break
@@ -632,7 +726,7 @@ async def run_execution_loop(
             json.dumps({
                 "task":        task,
                 "repo":        repo_full_name,
-                "success":     final_rc == 0,
+                "success":     final_rc == 0 and not unmet and not install_only,
                 "run_command": run_cmd,
                 "iterations":  iteration_log,
                 "fix_journal": fix_journal,
@@ -640,7 +734,7 @@ async def run_execution_loop(
             }, indent=2), encoding="utf-8")
 
         # ── 16. Capture output files ───────────────────────────────────────────
-        output_files = _capture_outputs(workspace, job_id)
+        output_files = _capture_outputs(workspace, job_id, pre_run_files)
         yield _ev("exec",
                   f"Outputs captured ({len(output_files)})",
                   "\n".join(output_files),
@@ -650,7 +744,7 @@ async def run_execution_loop(
         metrics["elapsed_s"] = total_elapsed
 
         # ── 17. Final report ───────────────────────────────────────────────────
-        if final_rc == 0:
+        if final_rc == 0 and not unmet and not install_only:
             summary      = await _build_success_summary(
                 task, repo_full_name, iteration_log,
                 fix_journal, run_cmd, final_stdout, metrics)
@@ -673,8 +767,8 @@ async def run_execution_loop(
                       "output_files":        output_files,
                       "run_script":          run_script,
                       "manual_guide":        manual_guide,
-                      "output": _fmt_output(
-                          final_rc, final_stdout, final_stderr)[:6000],
+                      "output": _clip(_fmt_output(
+                          final_rc, final_stdout, final_stderr)),
                   })
 
     except Exception as exc:
@@ -1036,6 +1130,48 @@ async def _read_key_files(
 #  LLM Execution Plan  (comprehensive single call)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Installing a packaged repo puts its console scripts on PATH, and for a library
+# that is usually the ONLY supported way to drive it: python-qrcode's documented
+# CLI is `qr`, and running its source tree directly (python -m qrcode.main) dies
+# on an ImportError. The planner cannot infer those names from the file tree, so
+# hand them over.
+_PYPROJECT_SCRIPTS = re.compile(
+    r"^\[project\.scripts\]\s*$(.*?)(?=^\[|\Z)", re.MULTILINE | re.DOTALL)
+_POETRY_SCRIPTS = re.compile(
+    r"^\[tool\.poetry\.scripts\]\s*$(.*?)(?=^\[|\Z)", re.MULTILINE | re.DOTALL)
+_TOML_SCRIPT_LINE = re.compile(
+    r"^\s*[\"']?([A-Za-z0-9_.\-]+)[\"']?\s*=", re.MULTILINE)
+_SETUP_CONSOLE = re.compile(
+    r"console_scripts[\"']?\s*:?\s*=?\s*\[(.*?)\]", re.DOTALL)
+_CFG_CONSOLE = re.compile(
+    r"console_scripts\s*=\s*(.*?)(?=^\S|\Z)", re.MULTILINE | re.DOTALL)
+_EP_NAME = re.compile(r"[\"']?\s*([A-Za-z0-9_.\-]+)\s*=\s*[A-Za-z0-9_.]+[:\s]")
+
+
+def _console_scripts(file_contents: dict[str, str]) -> list[str]:
+    """Command names this repo installs, read from its packaging metadata."""
+    names: list[str] = []
+
+    def take(raw: str, pattern: re.Pattern) -> None:
+        for m in pattern.finditer(raw or ""):
+            for n in _TOML_SCRIPT_LINE.findall(m.group(1)):
+                if n not in names:
+                    names.append(n)
+
+    for path, content in (file_contents or {}).items():
+        base = os.path.basename(path)
+        if base == "pyproject.toml":
+            take(content, _PYPROJECT_SCRIPTS)
+            take(content, _POETRY_SCRIPTS)
+        elif base in ("setup.py", "setup.cfg"):
+            for pat in (_SETUP_CONSOLE, _CFG_CONSOLE):
+                for m in pat.finditer(content or ""):
+                    for n in _EP_NAME.findall(m.group(1)):
+                        if n not in names:
+                            names.append(n)
+    return names
+
+
 async def _llm_plan(
     task:           str,
     repo_full_name: str,
@@ -1055,6 +1191,15 @@ async def _llm_plan(
             f"{'─'*50}\n"
             f"{content}\n"
         )
+
+    scripts = _console_scripts(file_contents)
+    scripts_block = (
+        "After the install step these commands are on PATH and are the "
+        f"SUPPORTED way to run this project: {', '.join(scripts)}. "
+        "Prefer one of them over running a source file directly."
+        if scripts else
+        "This repo installs no console scripts."
+    )
 
     not_runnable_categories_list = "\n".join(
         f'  "{k}": {v[:80]}...' for k, v in NOT_RUNNABLE_CATEGORIES.items()
@@ -1090,6 +1235,9 @@ Primary cmd   : {readme_cmds.get('primary_cmd', 'none')}
 ━━━━ KEY SOURCE FILES ({len(file_contents)} read) ━━━━━━━━━━━━━━━━━━━
 {files_block[:7000]}
 
+━━━━ INSTALLED CONSOLE SCRIPTS ━━━━━━━━━━━━━━━━━━
+{scripts_block}
+
 ━━━━ STATIC ANALYSIS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Entry point : {analysis.get('entry_point', '')}
 Run command : {analysis.get('run_command', '')}
@@ -1101,15 +1249,27 @@ Task plan   : {analysis.get('task_plan', [])}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 RUNNABILITY DECISION RULES (follow strictly):
-- runnable=true ONLY if there is a concrete Python entry point (main.py, app.py,
-  __main__.py, CLI entry, etc.) that produces observable output when executed.
-- runnable=false if ANY of these is true:
-    • Pure library with no CLI/entry point (only __init__.py, no main.py)
+- runnable=true if there is a concrete Python entry point (main.py, app.py,
+  __main__.py, a CLI entry, or a script under examples/ demos/ scripts/) that
+  does something observable when executed.
+- THIS ENVIRONMENT HAS A VIRTUAL DISPLAY and headless graphics drivers, so:
+    • Desktop GUI apps (Tkinter, PyQt, PySide, pygame, kivy, turtle) ARE
+      runnable. Launch them the normal way. They never exit on their own and
+      that is expected — starting without crashing is their success condition.
+    • matplotlib renders to file rather than to a window, so a script that
+      calls plt.show() runs fine and plt.savefig() produces a real image.
+    • Web UIs (Flask, FastAPI, Streamlit, Gradio, Django) ARE runnable for the
+      same reason: serving is the success condition, not exiting.
+  Do NOT mark any of these not_runnable for "needs a display", "is
+  interactive", or "never terminates".
+- A library with no entry point is still runnable if you can write a short
+  driver that imports it and prints or saves a result. Prefer doing that over
+  declaring it not runnable.
+- runnable=false only if ANY of these is true:
     • Requires GPU/CUDA that is unavailable
     • Requires large external data/weights not included
     • Requires paid API that cannot be stubbed (OpenAI, AWS, etc.)
     • Project is obviously incomplete (TODO placeholders, missing core files)
-    • GUI-only app (Tkinter, PyQt) with no headless mode
     • Missing essential credentials with no demo/mock mode
 - When runnable=false, pick the MOST SPECIFIC category from this list:
 {not_runnable_categories_list}
@@ -1248,11 +1408,30 @@ async def _llm_diagnose(
                 relevant[kp] = content[:800]
                 break
 
+    # A missing artifact has no traceback, so the loop above finds nothing.
+    # The LLM still needs to see the entry point it must add the save call to.
+    if error_class == "missing_artifact" and not relevant:
+        for cand in re.findall(r"([\w./\-]+\.py)", run_cmd):
+            base = os.path.basename(cand)
+            for kp, content in file_contents.items():
+                if os.path.basename(kp) == base:
+                    relevant[kp] = content[:2500]
+                    break
+            if relevant:
+                break
+
     extra_context = ""
 
-    if error_class == "missing_argument":
+    if error_class in ("missing_argument", "missing_artifact"):
         help_output = await _fetch_help_output(run_cmd, workspace, venv_path)
-        if help_output:
+        if help_output and error_class == "missing_artifact":
+            extra_context = (
+                f"\n━━━━ --help OUTPUT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{help_output[:3000]}\n\n"
+                f"INSTRUCTION: look for the option that sets the output file "
+                f"and build a revised_command that uses it."
+            )
+        elif help_output:
             extra_context = (
                 f"\n━━━━ --help OUTPUT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"{help_output[:3000]}\n\n"
@@ -1263,11 +1442,45 @@ async def _llm_diagnose(
                 f"For file paths use './outputs/' as output dir. "
                 f"For model/size options pick the smallest/fastest default."
             )
-        else:
+        elif error_class == "missing_argument":
             extra_context = (
                 f"\nNOTE: Missing-argument error. Task: '{task}'. "
                 f"Build a revised_command with required args from the task."
             )
+
+    if error_class == "install_only":
+        extra_context += (
+            f"\nNOTE: the previous command only installed a package. Installing "
+            f"is a pre-step, not a run. Task: '{task}'. Give a revised_command "
+            f"that actually exercises the repo — run its entry point, its "
+            f"console script, or a short driver you place in files_to_create "
+            f"that imports the library and prints or saves a real result."
+        )
+
+    if error_class == "missing_artifact":
+        extra_context += (
+            f"\nNOTE: the command already exits 0 — do NOT chase a crash. "
+            f"The problem is that the task's output file was never written. "
+            f"Task: '{task}'. Either pass the option that sets the output path "
+            f"(check the --help output / the project's CLI), or add the explicit "
+            f"save call to the entry point and put that file's COMPLETE new "
+            f"content in files_to_create. Do not replace a working script with "
+            f"a guessed API: use only functions you can see in RELEVANT SOURCE "
+            f"FILES."
+        )
+
+    if error_class == "unexpected_kwarg":
+        m   = AUTOFIX_PATTERNS["unexpected_kwarg"].search(run_output)
+        kw  = m.group(1) if m else ""
+        extra_context += (
+            f"\nNOTE: a library removed the keyword argument '{kw}' that this "
+            f"repo still passes — the repo predates the installed version. "
+            f"No command-line option can fix this. Either pin the library to a "
+            f"release that still accepted '{kw}' via packages_to_install, or "
+            f"delete the '{kw}' argument from the call site and put the file's "
+            f"COMPLETE new content in files_to_create. Prefer editing the call "
+            f"site when the keyword was a no-op or cosmetic."
+        )
 
     if AUTOFIX_PATTERNS["api_change"].search(run_output):
         m   = AUTOFIX_PATTERNS["api_change"].search(run_output)
@@ -1283,7 +1496,7 @@ FAILED COMMAND:
 {run_cmd}
 
 ERROR OUTPUT:
-{run_output[:3000]}
+{_clip(run_output, 3000, 900)}
 {extra_context}
 
 RELEVANT SOURCE FILES:
@@ -1330,7 +1543,11 @@ will repeat next attempt."""
                 "Return ONLY valid JSON. No markdown."
             ),
             user=prompt,
-            max_tokens=3000,
+            # This call is asked for a file's COMPLETE new content, and the
+            # reasoning models behind it spend tokens before emitting any. At
+            # 3000 a pymaze attempt came back with finish_reason=length and no
+            # content at all, burning a retry for nothing.
+            max_tokens=6000,
             metrics=metrics,
             temperature=0.1,
         )
@@ -2423,10 +2640,45 @@ def _kill_process_tree(proc: "asyncio.subprocess.Process") -> None:
         pass
 
 
+def _targets_gui(run_cmd: str, workspace: str) -> bool:
+    """True when the file this command runs imports a desktop GUI toolkit.
+
+    Scoped to the targeted file rather than the whole repo on purpose: plenty
+    of projects ship a tkinter example next to a perfectly ordinary CLI, and
+    treating those as GUI apps would make a genuine hang look like a success.
+    """
+    candidates: list[str] = []
+    try:
+        # An LLM-authored command can carry an unbalanced quote, and shlex
+        # raises on those. A GUI guess is never worth killing the run for.
+        tokens = shlex.split(run_cmd.replace("&&", " ")) if run_cmd else []
+    except ValueError:
+        return False
+    for tok in tokens:
+        if tok.endswith(".py"):
+            candidates.append(tok)
+        elif tok.count(".") and "/" not in tok and not tok.startswith("-"):
+            candidates.append(tok.replace(".", "/") + ".py")   # `python -m pkg.app`
+    for rel in candidates:
+        path = os.path.join(workspace, rel)
+        try:
+            if not os.path.realpath(path).startswith(os.path.realpath(workspace)):
+                continue
+            if os.path.getsize(path) > 1_000_000:
+                continue
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                if _GUI_TOOLKITS.search(fh.read()):
+                    return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 async def _run_direct(
     run_cmd:   str,
     workspace: str,
     venv_path: str,
+    is_gui:    bool = False,
 ) -> tuple[int, str, str]:
     """
     Runs the command, streaming stdout/stderr while it's alive.
@@ -2438,8 +2690,22 @@ async def _run_direct(
     once a startup banner or an open port is seen and stays up for
     SERVER_CONFIRM_GRACE seconds, we treat it as a confirmed success and
     close it ourselves rather than waiting out the timeout.
+
+    `is_gui` extends exactly the same reasoning to desktop applications. A
+    tkinter or pygame program prints no banner and opens no port, so there is
+    nothing to watch for — but it is just as deliberately long-running, and
+    staying alive IS its success condition. When the caller has established
+    from the source that the entry point drives a GUI event loop, surviving
+    SERVER_CONFIRM_GRACE seconds without dying counts as a successful run.
     """
-    activate     = f'source "{venv_path}/bin/activate"' if venv_path else ""
+    activate = f'source "{venv_path}/bin/activate"' if venv_path else ""
+
+    # tkinter is the one toolkit that cannot be talked out of needing a real X
+    # display, so a GUI run gets a throwaway one. Deliberately NOT added to the
+    # generated run_final.sh the user copies: their machine has a display, and
+    # xvfb-run probably is not installed on it.
+    gui_prefix = "xvfb-run -a " if (is_gui and shutil.which("xvfb-run")) else ""
+
     shell_script = (
         "#!/bin/bash\n"
         "set -o pipefail\n"
@@ -2450,7 +2716,8 @@ async def _run_direct(
         # --foreground keeps the monitored command in OUR process group instead
         # of spawning its own — otherwise os.killpg() in _kill_process_tree()
         # can't reach it and server processes (uvicorn, runserver, ...) leak.
-        + f"timeout --foreground {SCRIPT_TIMEOUT} bash -c {shlex.quote(run_cmd)}\n"
+        + f"{gui_prefix}timeout --foreground {SCRIPT_TIMEOUT} "
+          f"bash -c {shlex.quote(run_cmd)}\n"
     )
     tmp = Path(workspace) / ".run_direct.sh"
     tmp.write_text(shell_script, encoding="utf-8")
@@ -2465,7 +2732,21 @@ async def _run_direct(
                 **os.environ,
                 "PYTHONPATH":  workspace,
                 "HOME":        os.environ.get("HOME", "/tmp"),
-                "MPLBACKEND":  "Agg",   # render to file, never open a GUI window
+                # Headless rendering for every toolkit we might meet. There is
+                # no display in the container, and without these a GUI repo
+                # dies on `couldn't connect to display` or `No available video
+                # device` instead of running. With them, matplotlib writes PNGs
+                # instead of opening windows and pygame/Qt draw to an offscreen
+                # buffer, so the program runs its real code path.
+                "MPLBACKEND":        "Agg",
+                "SDL_VIDEODRIVER":   "dummy",
+                "SDL_AUDIODRIVER":   "dummy",
+                "QT_QPA_PLATFORM":   "offscreen",
+                "PYGAME_HIDE_SUPPORT_PROMPT": "1",
+                # Deliberately NOT inside the workspace: matplotlib writes a
+                # font cache here, and the output sweep would then offer the
+                # user "fontlist-v3.11.0.json" as a result of their run.
+                "MPLCONFIGDIR":      tempfile.gettempdir(),
             },
             start_new_session=True,   # own process group so we can kill server workers too
         )
@@ -2499,6 +2780,13 @@ async def _run_direct(
 
             combined = (bytes(stdout_buf) + bytes(stderr_buf)).decode(errors="ignore")
             looks_like_server = bool(_UI_SERVER_STARTED.search(combined))
+            # A GUI app that is still alive and has not raised is running. The
+            # traceback check is what keeps this honest: a window that fails to
+            # open still prints one, and that must stay a failure.
+            if not looks_like_server and is_gui:
+                alive_for = time.monotonic() - started_at
+                if alive_for >= SERVER_CONFIRM_GRACE and "Traceback" not in combined:
+                    looks_like_server = True
             if not looks_like_server:
                 for port in _guess_ports(run_cmd, combined):
                     if await _probe_port(port):
@@ -2530,11 +2818,16 @@ async def _run_direct(
             t.cancel()
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
 
-    stdout = bytes(stdout_buf).decode(errors="ignore")[:6000]
-    stderr = bytes(stderr_buf).decode(errors="ignore")[:6000]
+    stdout = _clip(bytes(stdout_buf).decode(errors="ignore"))
+    stderr = _clip(bytes(stderr_buf).decode(errors="ignore"))
 
     if confirmed_server:
-        return 0, stdout, stderr
+        kind = "GUI application" if is_gui else "server"
+        note = (f"\n[RepoSage] {kind} started and stayed up for "
+                f"{SERVER_CONFIRM_GRACE}s, so the run is counted as successful. "
+                f"A {kind} never exits on its own, which is why there is no "
+                f"exit code of its own; RepoSage stopped it.")
+        return 0, (stdout + note if stdout.strip() else note.lstrip()), stderr
     if proc.returncode is not None:
         return proc.returncode, stdout, stderr
     return 1, stdout, stderr + f"\nCommand timed out after {SCRIPT_TIMEOUT}s"
@@ -2547,6 +2840,8 @@ async def _run_direct(
 def _classify_error(output: str) -> str:
     if AUTOFIX_PATTERNS["interactive_prompt"].search(output):
         return "interactive_prompt"
+    if AUTOFIX_PATTERNS["unexpected_kwarg"].search(output):
+        return "unexpected_kwarg"
     if AUTOFIX_PATTERNS["missing_argument"].search(output):
         return "missing_argument"
     if AUTOFIX_PATTERNS["api_change"].search(output):
@@ -2561,7 +2856,8 @@ def _classify_error(output: str) -> str:
         return "permission_error"
     for cls, pattern in AUTOFIX_PATTERNS.items():
         if cls in ("api_change", "missing_module", "interactive_prompt",
-                   "cuda_error", "missing_argument", "port_in_use", "permission"):
+                   "cuda_error", "missing_argument", "unexpected_kwarg",
+                   "port_in_use", "permission"):
             continue
         if pattern.search(output):
             return cls
@@ -2721,7 +3017,124 @@ async def _inject_input_files(
 #  Output Capture
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _capture_outputs(workspace: str, job_id: str) -> list[str]:
+# Directories that never hold a run artefact worth showing the user.
+_CAPTURE_SKIP_DIRS = {
+    ".git", ".venv", "venv", "env", "node_modules", "__pycache__",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "site-packages",
+    ".idea", ".vscode", "build", "dist", ".eggs",
+}
+_CAPTURE_SCAN_DEPTH = 3     # scan the repo root and two levels below it
+_CAPTURE_MAX_SWEPT  = 25    # a run that writes 10k tiles is not a gallery
+
+
+# A task that names a file is a task with a deliverable. "exit 0" alone does not
+# mean that deliverable exists — pymaze exits 0 after the LLM rewrote its example
+# into a script that builds a Visualizer and saves nothing. Only paths introduced
+# by a save/write cue count, so "read data.csv and print stats" names an input,
+# not an artifact, and is left alone.
+# Unambiguous verbs only. "output" is deliberately absent: as a noun ("compare
+# the output to baseline.json") it would license a bare preposition and turn an
+# input reference into a phantom deliverable.
+_SAVE_VERB = re.compile(
+    r"\b(?:save[ds]?|saving|writ(?:e|es|ing|ten)|export(?:s|ed|ing)?|"
+    r"stor(?:e|es|ing|ed)|produce[sd]?|generate[sd]?|convert(?:s|ed|ing)?|"
+    r"creat(?:e|es|ing|ed)|render(?:s|ed|ing)?|dump(?:s|ed)?)\b", re.IGNORECASE)
+
+# Only a path introduced by a cue counts, and a bare preposition ("as", "to",
+# "into") counts only when the task also expresses an output intent somewhere —
+# otherwise "count the words in sample.txt" would be read as a deliverable.
+# "in" and "at" are excluded entirely: they almost always introduce an input.
+_ARTIFACT_CUE = re.compile(
+    r"\b(?P<cue>save[ds]?|saving|writ(?:e|es|ing|ten)|export(?:s|ed|ing)?|"
+    r"output(?:s|ting)?|stor(?:e|es|ing|ed)|produce[sd]?|generate[sd]?|"
+    r"creat(?:e|es|ing|ed)|render(?:s|ed|ing)?|dump(?:s|ed)?|as|to|into)\s+"
+    r"(?:a\s+|an\s+|the\s+|it\s+as\s+|file\s+|image\s+)*"
+    r"[`\'\"]?(?P<path>(?:[\w.\-]+[/\\])*[\w.\-]+\.(?:png|jpe?g|gif|svg|bmp|webp|pdf|"
+    r"csv|tsv|json|jsonl|txt|md|html|xml|yaml|yml|mp3|mp4|wav|avi|zip|xlsx))[`\'\"]?",
+    re.IGNORECASE)
+
+_BARE_CUES = {"as", "to", "into"}
+
+
+# Installing a dependency is a pre-step, never the run. Textualize/rich was
+# reported successful off `python -m pip install rich`: pip exits 0, no table is
+# ever printed, and because the task named no file the artifact gate stays
+# dormant. Nothing legitimate runs a project by only installing something.
+_INSTALL_ONLY = re.compile(
+    r"^(?:python[\d.]*\s+-m\s+)?(?:pip[\d.]*|pipx|uv|poetry|conda|apt|apt-get|"
+    r"npm|yarn|pnpm)\s+(?:install|add|-r)\b", re.IGNORECASE)
+
+
+def _is_install_only(run_cmd: str) -> bool:
+    """True when every step of the command is just installing something."""
+    cmd = (run_cmd or "").strip()
+    if not cmd:
+        return False
+    steps = [t.strip() for t in re.split(r"&&|;", cmd) if t.strip()]
+    # Scaffolding like `mkdir -p outputs` or `cd src` says nothing either way.
+    real = [t for t in steps
+            if not re.match(r"^(?:mkdir|cd|export|set|source|\.)\b", t, re.IGNORECASE)]
+    return bool(real) and all(_INSTALL_ONLY.match(t) for t in real)
+
+
+def _expected_artifacts(task: str) -> list[str]:
+    """Output paths the task names explicitly, as repo-relative strings."""
+    task = task or ""
+    has_intent = bool(_SAVE_VERB.search(task))
+    seen: list[str] = []
+    for m in _ARTIFACT_CUE.finditer(task):
+        if m.group("cue").lower() in _BARE_CUES and not has_intent:
+            continue
+        rel = m.group("path").replace("\\", "/").lstrip("./")
+        if rel and rel not in seen:
+            seen.append(rel)
+    return seen
+
+
+def _missing_artifacts(expected: list[str], workspace: str,
+                       pre_run_files: set[str] | None = None) -> list[str]:
+    """Which expected artifacts the run did not produce.
+
+    Matched on basename anywhere in the tree, because a script that honours the
+    task but writes ./maze.png instead of ./outputs/maze.png has still done the
+    work. Files that existed before the run do not count: pymaze ships a
+    maze_solution.png at its root, and a repo shipping the very name the task
+    asks for must not be able to satisfy the task by doing nothing.
+    """
+    if not expected:
+        return []
+    ws = Path(workspace)
+    pre = pre_run_files or set()
+    produced: set[str] = set()
+    for root, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if d not in _CAPTURE_SKIP_DIRS]
+        for f in files:
+            try:
+                rel = str(Path(root, f).relative_to(ws))
+            except ValueError:
+                continue
+            if rel not in pre:
+                produced.add(f.lower())
+    return [e for e in expected
+            if os.path.basename(e).lower() not in produced]
+
+
+def _snapshot_files(workspace: str) -> set[str]:
+    """Relative paths present before the run, so new ones can be told apart."""
+    seen: set[str] = set()
+    ws = Path(workspace)
+    for root, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if d not in _CAPTURE_SKIP_DIRS]
+        for f in files:
+            try:
+                seen.add(str(Path(root, f).relative_to(ws)))
+            except ValueError:
+                pass
+    return seen
+
+
+def _capture_outputs(workspace: str, job_id: str,
+                     pre_run_files: set[str] | None = None) -> list[str]:
     job_dir = Path(OUTPUT_ROOT) / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     ws      = Path(workspace)
@@ -2745,6 +3158,44 @@ def _capture_outputs(workspace: str, job_id: str) -> list[str]:
                 rel       = fpath.relative_to(outputs_dir)
                 dest_name = "__".join(rel.parts)
                 _copy(fpath, dest_name)
+
+    # Artefacts written anywhere else in the repo.
+    #
+    # Capturing only `outputs/` meant the result depended on where the LLM
+    # happened to point the run command. Measured twice on amueller/word_cloud
+    # with the same task: one run wrote outputs/wordcloud.png and the image
+    # appeared, the next wrote wordcloud.png at the repo root and the user was
+    # told "Task completed — producing a wordcloud.png image" above a file list
+    # that did not contain it. Same repo, same prompt, different outcome.
+    #
+    # Only files that did not exist before the run are swept, so a project's
+    # own committed screenshots and fixtures are never picked up.
+    if pre_run_files is not None:
+        swept = 0
+        for root, dirs, files in os.walk(ws):
+            dirs[:] = [d for d in dirs if d not in _CAPTURE_SKIP_DIRS]
+            rel_root = Path(root).relative_to(ws)
+            # Pruning `dirs` stops the walk DESCENDING, but os.walk still hands
+            # us this directory's own files — so too-deep files need their own
+            # `continue`, not just a pruned child list.
+            if len(rel_root.parts) >= _CAPTURE_SCAN_DEPTH:
+                dirs[:] = []
+                continue
+            if rel_root.parts and rel_root.parts[0] == "outputs":
+                continue                       # already taken, verbatim
+            for fname in sorted(files):
+                if swept >= _CAPTURE_MAX_SWEPT:
+                    break
+                rel = str(rel_root / fname) if rel_root.parts else fname
+                if rel in pre_run_files:
+                    continue                   # shipped with the repo
+                if Path(fname).suffix.lower() not in OUTPUT_EXTENSIONS:
+                    continue
+                dest = "__".join((rel_root / fname).parts) if rel_root.parts else fname
+                if dest in captured:
+                    continue
+                _copy(Path(root) / fname, dest)
+                swept += 1
 
     return captured
 
@@ -2775,6 +3226,25 @@ async def _run_cmd(
         return False, "Command timed out"
     except Exception as exc:
         return False, str(exc)
+
+
+def _clip(text: str, limit: int = 6000, head: int = 1800) -> str:
+    """Trim a stream to `limit` chars while keeping BOTH ends.
+
+    Plain truncation keeps the first 6000 characters, which is exactly the
+    wrong half: a program that logs verbosely pushes its traceback past the
+    cut, so the error that explains the failure never reaches the report or
+    the LLM that is supposed to fix it. Measured on jostbr/pymaze, whose
+    matplotlib font-manager debug output filled the whole buffer and left
+    "EXIT CODE: 1" with no visible cause.
+    """
+    if len(text) <= limit:
+        return text
+    tail = limit - head
+    cut  = len(text) - head - tail
+    return (f"{text[:head]}\n"
+            f"... [{cut} characters omitted] ...\n"
+            f"{text[-tail:]}")
 
 
 def _fmt_output(rc: int, stdout: str, stderr: str) -> str:

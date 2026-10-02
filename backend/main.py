@@ -26,12 +26,15 @@ load_dotenv(_HERE / ".env", override=True)
 
 from search import search_repos, fetch_readme
 from analyzer import analyze_repo
-from architect import generate_architecture
+from architect import (
+    generate_architecture,
+    DIAGRAM_KINDS,
+    DEFAULT_KIND as DEFAULT_DIAGRAM_KIND,
+)
 from chat import answer_question
 from rag import build_index, index_info
 from executor import run_execution_loop, OUTPUT_ROOT, CREDENTIAL_STORE, CREDENTIAL_EVENTS
 from tester import run_test_loop
-from autofix import run_autofix_loop
 from copydetector.detector import VenDetector, Detection, Source, Status
 from copydetector.repo import Repository, File as RepoFile
 from copydetector.errors import VendetectError, VendetectRuntimeError
@@ -270,10 +273,6 @@ class TestRequest(BaseModel):
     repo_full_name: str
     job_id:         str = ""
 
-class AutofixRequest(BaseModel):
-    repo_full_name: str
-    job_id:         str = ""
-
 class TaskExecRequest(BaseModel):
     task:           str
     repo_full_name: str
@@ -282,6 +281,7 @@ class TaskExecRequest(BaseModel):
 
 class ArchitectRequest(BaseModel):
     repo_full_name: str
+    kind:           str = DEFAULT_DIAGRAM_KIND   # architecture | sequence | dataflow
 
 class RagBuildRequest(BaseModel):
     repo_full_name: str
@@ -297,6 +297,11 @@ class ChatRequest(BaseModel):
 
 class CredentialSubmit(BaseModel):
     credentials: dict[str, str]
+
+# How deep find_probable_copy may walk git history. Unbounded (the library
+# default) hangs on any repo with real history; 2 keeps the behaviour bounded.
+COPYDETECT_HISTORY_DEPTH = int(os.environ.get("COPYDETECT_MAX_HISTORY_DEPTH", "2"))
+
 
 class CopyDetectRequest(BaseModel):
     mode:           str = "cross_repo"   # "cross_repo" | "self_scan"
@@ -394,11 +399,21 @@ async def rag_status(repo_owner: str, repo_name: str,
 
 
 # ── Architecture diagram (SSE) ───────────────────────────────────────────────
+@app.get("/api/architect/kinds")
+async def architect_kinds(user: Optional[dict] = Depends(get_optional_user)):
+    """Diagram kinds the backend can draw, so the UI never offers a dead option."""
+    return {
+        "default": DEFAULT_DIAGRAM_KIND,
+        "kinds": [{"id": k, "label": v["label"], "focus": v["focus"]}
+                  for k, v in DIAGRAM_KINDS.items()],
+    }
+
+
 @app.post("/api/architect")
 async def architect(req: ArchitectRequest,
                     user: Optional[dict] = Depends(get_optional_user)):
     async def event_stream() -> AsyncGenerator[str, None]:
-        async for event in generate_architecture(req.repo_full_name):
+        async for event in generate_architecture(req.repo_full_name, kind=req.kind):
             yield f"data: {json.dumps(event)}\n\n"
             await asyncio.sleep(0)
 
@@ -738,10 +753,23 @@ async def copy_detect(req: CopyDetectRequest,
                             return True
 
                     status = _SSEStatus(queue, loop)
-                    vend = VenDetector(status=status)
+                    # VenDetector.find_probable_copy walks git history to guess
+                    # WHEN code was copied, and its default depth is unbounded.
+                    # It runs once per detection and branches three ways per
+                    # level, spawning a `git` subprocess at every node, so on a
+                    # repo with real history it never returns: psf/requests vs
+                    # its own fork sat on a single detection for over 8 minutes
+                    # ("max depth: ∞" in the log) and the request simply hung.
+                    # The walk also cannot change the answer — it re-compares
+                    # the same two File objects at every node instead of the
+                    # historical versions — so bounding it costs no accuracy.
+                    vend = VenDetector(status=status,
+                                       max_history_depth=COPYDETECT_HISTORY_DEPTH)
                     count = 0
 
-                    for det in vend.detect(test_repo, source_repo, file_filter=file_filter):
+                    for det in vend.detect(test_repo, source_repo,
+                                           file_filter=file_filter,
+                                           max_history_depth=COPYDETECT_HISTORY_DEPTH):
                         det_dict = _detection_to_dict(det, min_sim)
                         if det_dict:
                             count += 1
@@ -841,24 +869,6 @@ async def test_repo(req: TestRequest,
 
     async def event_stream() -> AsyncGenerator[str, None]:
         async for event in run_test_loop(req.repo_full_name, job_id=job_id):
-            yield f"data: {json.dumps(event)}\n\n"
-            await asyncio.sleep(0)
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-# ── Semgrep autofix → pull request (SSE) ─────────────────────────────────────
-@app.post("/api/autofix")
-async def autofix_repo(req: AutofixRequest,
-                       user: Optional[dict] = Depends(get_optional_user)):
-    job_id = req.job_id or ""
-
-    async def event_stream() -> AsyncGenerator[str, None]:
-        async for event in run_autofix_loop(req.repo_full_name, job_id=job_id):
             yield f"data: {json.dumps(event)}\n\n"
             await asyncio.sleep(0)
 

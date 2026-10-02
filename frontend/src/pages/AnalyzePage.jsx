@@ -697,7 +697,7 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
     modules = [], classes = [], fcg_edges = [], mdg_edges = [],
     core_components = [], core_scores = [], metrics = {},
     task_plan = [], readme_summary = '', key_files = [],
-    file_tree = null,
+    file_tree = null, clusters = [],
   } = analysis
 
   return (
@@ -771,7 +771,8 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
       </div>
 
       {view === 'cluster' ? (
-        <ClusterView modules={modules} fcgEdges={fcg_edges} coreComponents={core_components} />
+        <ClusterView modules={modules} fcgEdges={fcg_edges}
+                     coreComponents={core_components} clusters={clusters} />
       ) : (
         <>
           {/* ── Row 1: HCT + Files + Scores ──────────────────────────────── */}

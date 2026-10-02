@@ -31,6 +31,9 @@ services:
         required: false
     environment:
       EXECUTOR_OUTPUT_ROOT: /data/outputs
+      # Copy Detector corpus (faiss index + metadata). Must live on the volume:
+      # its default is $HOME inside the image, which a restart throws away.
+      CORPUS_ROOT: /data/outputs/corpus
       REPO_TASK_WORKSPACE_ROOT: /data/outputs/taskexec
       CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-}
     volumes:
@@ -43,8 +46,10 @@ services:
     mem_limit: 3g
     pids_limit: 512
     cpus: 1.5
+    # `exec` is required — Docker's tmpfs default is noexec, which makes
+    # every venv built here unusable (audit silently scores every repo 100).
     tmpfs:
-      - /tmp:size=6g
+      - /tmp:size=6g,exec
 
   web:
     image: ${DOCKERHUB_USER:?set DOCKERHUB_USER in .env}/reposage-web:${TAG:-latest}

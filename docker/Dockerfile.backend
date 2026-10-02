@@ -5,18 +5,27 @@
 FROM python:3.13-slim
 
 # System packages the app shells out to at RUNTIME (not just build time):
-#   git              — executor.py / tester.py / autofix.py clone every repo
+#   git              — executor.py / tester.py clone every repo
 #                      they analyse; without it the whole pipeline dies at
 #                      step 1 with a confusing "git: not found"
 #   build-essential  — analysed repos frequently have deps with C extensions
 #                      that compile during their pip install
 #   ca-certificates  — TLS to Groq, GitHub, HuggingFace, Serper, Jina
+#   xvfb + tk        — analysed repos are often desktop apps. pygame and Qt can
+#                      be forced offscreen with env vars, but tkinter cannot:
+#                      it needs a real X display or it dies on
+#                      "no display name and no $DISPLAY". xvfb-run gives it a
+#                      throwaway one, so a GUI repo runs its actual code path
+#                      instead of being reported as broken.
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         build-essential \
         ca-certificates \
         curl \
+        xvfb \
+        xauth \
+        tk \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 \
