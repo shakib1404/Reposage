@@ -581,11 +581,6 @@ async def run_execution_loop(
 
             elapsed    = round(time.monotonic() - t_attempt, 2)
             run_output = _fmt_output(final_rc, final_stdout, final_stderr)
-            # A GUI or server that was killed after staying up never had the
-            # chance to write a file, so it is exempt from the artifact gate.
-            stayed_up  = ("[RepoSage]" in final_stdout
-                          or bool(_UI_SERVER_STARTED.search(
-                              final_stdout + final_stderr)))
 
             iteration_log.append({
                 "attempt":    attempt + 1,
@@ -605,10 +600,20 @@ async def run_execution_loop(
             # Exit 0 is necessary but not sufficient: if the task named a file
             # and that file does not exist, the task is not done. Feed the gap
             # back into the retry loop instead of reporting a hollow success.
-            # A GUI or server that merely stayed up is exempt — it was never
-            # going to write anything on its own.
+            #
+            # Staying up used to exempt a run from this check, on the grounds
+            # that a GUI or server was never going to write anything. That is
+            # true for "run the snake game" or "start the web server" — and
+            # those tasks name no artefacts, so they are exempt anyway, because
+            # expected_artifacts is empty. The exemption only ever bit when the
+            # task DID name a file: asked for outputs/barcode.png, the agent
+            # launched the repo's Flask app instead, the server sat there for
+            # ten seconds, and that was reported as success with no image
+            # anywhere. Picking a server when the task wanted a file is exactly
+            # the wrong-entry-point mistake this gate exists to send back round
+            # the loop, so a named artefact is now required either way.
             unmet = []
-            if final_rc == 0 and expected_artifacts and not stayed_up:
+            if final_rc == 0 and expected_artifacts:
                 unmet = _missing_artifacts(expected_artifacts, workspace,
                                            pre_run_files)
             install_only = final_rc == 0 and _is_install_only(run_cmd)
@@ -3091,32 +3096,128 @@ def _expected_artifacts(task: str) -> list[str]:
     return seen
 
 
+# Formats whose first bytes identify them beyond argument. Only extensions that
+# can be judged with certainty belong here — a wrong guess would reject correct
+# work, which is far worse than the hollow success this is guarding against.
+def _is_html(b: bytes) -> bool:
+    return re.search(rb"<\s*(!doctype|html|body|div|p|h[1-6]|table|span|a)\b",
+                     b[:4096], re.I) is not None
+
+
+def _is_json(b: bytes, truncated: bool = False) -> bool:
+    """Parse when the whole file is in hand; otherwise judge the opening byte.
+
+    Parsing a prefix always fails, so reading only the head would reject every
+    large-but-valid JSON — a 39MB data.json written by a perfectly good run was
+    the case that caught this.
+    """
+    head = b.lstrip()[:1]
+    if head not in (b"{", b"["):
+        return False
+    if truncated:
+        return True
+    try:
+        json.loads(b.decode("utf-8", "ignore"))
+        return True
+    except Exception:
+        return False
+
+
+def _is_png(b: bytes) -> bool:
+    """A real PNG, and one with actual picture in it.
+
+    A 1x1 PNG is a valid file and a useless deliverable: asked for a barcode
+    image, one repo's script wrote a 67-byte single pixel, which satisfied a
+    magic-byte check and showed up in the UI as a blank square. Nothing a task
+    asks to "save as an image" is legitimately one pixel.
+    """
+    if not b.startswith(b"\x89PNG\r\n\x1a\n") or len(b) < 24:
+        return False
+    width  = int.from_bytes(b[16:20], "big")
+    height = int.from_bytes(b[20:24], "big")
+    return width > 1 and height > 1
+
+
+_FORMAT_CHECKS = {
+    ".png":  _is_png,
+    ".jpg":  lambda b: b.startswith(b"\xff\xd8\xff"),
+    ".jpeg": lambda b: b.startswith(b"\xff\xd8\xff"),
+    ".gif":  lambda b: b.startswith((b"GIF87a", b"GIF89a")),
+    ".pdf":  lambda b: b.lstrip()[:5] == b"%PDF-",
+    ".zip":  lambda b: b.startswith(b"PK\x03\x04"),
+    ".xlsx": lambda b: b.startswith(b"PK\x03\x04"),
+    ".docx": lambda b: b.startswith(b"PK\x03\x04"),
+    ".svg":  lambda b: b"<svg" in b[:4096].lower(),
+    ".html": _is_html,
+    ".htm":  _is_html,
+    ".json": _is_json,
+}
+
+
+def _wrong_format(path: Path, name: str) -> bool:
+    """True when the file exists but plainly is not the format its name claims.
+
+    Existence alone proved too weak. Asked to render markdown to
+    outputs/page.html, the agent picked `markdownify` — which converts the
+    other direction — and wrote markdown into a .html file: exit 0, file
+    present, gate satisfied, and not one HTML tag in it. An empty file counts
+    as wrong too; a zero-byte PNG is not a PNG.
+    """
+    check = _FORMAT_CHECKS.get(Path(name).suffix.lower())
+    if check is None:
+        return False
+    LIMIT = 4_000_000
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            head = fh.read(LIMIT)
+    except OSError:
+        return False
+    if not head.strip():
+        return True                       # a zero-byte PNG is not a PNG
+    truncated = size > LIMIT
+    try:
+        return not check(head, truncated)
+    except TypeError:                     # magic-byte checks take bytes only
+        return not check(head)
+
+
 def _missing_artifacts(expected: list[str], workspace: str,
                        pre_run_files: set[str] | None = None) -> list[str]:
-    """Which expected artifacts the run did not produce.
+    """Which expected artifacts the run did not produce, or produced wrongly.
 
     Matched on basename anywhere in the tree, because a script that honours the
     task but writes ./maze.png instead of ./outputs/maze.png has still done the
     work. Files that existed before the run do not count: pymaze ships a
     maze_solution.png at its root, and a repo shipping the very name the task
     asks for must not be able to satisfy the task by doing nothing.
+
+    A file whose contents contradict its extension counts as missing — see
+    _wrong_format.
     """
     if not expected:
         return []
     ws = Path(workspace)
     pre = pre_run_files or set()
-    produced: set[str] = set()
+    produced: dict[str, Path] = {}
     for root, dirs, files in os.walk(ws):
         dirs[:] = [d for d in dirs if d not in _CAPTURE_SKIP_DIRS]
         for f in files:
+            full = Path(root, f)
             try:
-                rel = str(Path(root, f).relative_to(ws))
+                rel = str(full.relative_to(ws))
             except ValueError:
                 continue
             if rel not in pre:
-                produced.add(f.lower())
-    return [e for e in expected
-            if os.path.basename(e).lower() not in produced]
+                produced.setdefault(f.lower(), full)
+
+    unmet = []
+    for e in expected:
+        base = os.path.basename(e).lower()
+        hit = produced.get(base)
+        if hit is None or _wrong_format(hit, base):
+            unmet.append(e)
+    return unmet
 
 
 def _snapshot_files(workspace: str) -> set[str]:

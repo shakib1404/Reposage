@@ -44,7 +44,7 @@ curl -o .env https://raw.githubusercontent.com/shakib1404/Reposage/master/deploy
 # 2. Fill in .env — at minimum MONGO_URL, JWT_SECRET, GROQ_API_KEY_1
 nano .env
 echo "DOCKERHUB_USER=shakib1404" >> .env
-echo "TAG=v1"                    >> .env
+echo "TAG=v2"                    >> .env
 
 # 3. Run
 docker compose -f docker-compose.hub.yml up -d
@@ -60,13 +60,17 @@ open **http://localhost** (or the server's IP).
 
 **Published images**
 
-| Image | Size (compressed) |
-|---|---|
-| [`shakib1404/reposage-backend`](https://hub.docker.com/r/shakib1404/reposage-backend) `:v1` `:latest` | ~790 MB |
-| [`shakib1404/reposage-web`](https://hub.docker.com/r/shakib1404/reposage-web) `:v1` `:latest` | ~24 MB |
+| Image | Tags | Size (compressed) |
+|---|---|---|
+| [`shakib1404/reposage-backend`](https://hub.docker.com/r/shakib1404/reposage-backend) | `:v2` `:latest`, `:v1` | ~830 MB |
+| [`shakib1404/reposage-web`](https://hub.docker.com/r/shakib1404/reposage-web) | `:v2` `:latest`, `:v1` | ~25 MB |
 
 Pin `TAG` to a version rather than tracking `latest`, so a bad push does not
-roll itself out on your next restart.
+roll itself out on your next restart. `v1` is kept as the rollback point —
+`TAG=v1` and a restart puts the previous build back.
+
+`v2` adds the sequence / data-flow diagrams, the multi-model Groq fallback, and
+drops the audit's autofix endpoint.
 
 ### Build it yourself instead
 

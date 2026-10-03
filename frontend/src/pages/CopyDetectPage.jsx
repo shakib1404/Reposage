@@ -272,8 +272,16 @@ function DuplicateCard({ dup, index }) {
 
 // ── Single corpus-match card ─────────────────────────────────────────────────────
 
+// A bare method name is ambiguous across classes — `_strip_punc_if_word` says
+// nothing about which class it belongs to, and the backend already sends the
+// scope. `null` means module level, which is itself worth showing.
+function qualify(cls, fn) {
+  return cls ? `${cls}.${fn}` : fn
+}
+
 function CorpusMatchCard({ m, index }) {
   const [expanded, setExpanded] = useState(index === 0)
+  const moduleLevel = !m.query_class && !m.matched_class
 
   return (
     <div style={{
@@ -300,9 +308,16 @@ function CorpusMatchCard({ m, index }) {
 
         <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
-            <span style={{ color: 'var(--accent)', fontFamily: 'var(--mono)' }}>{m.query_function}</span>
+            <span style={{ color: 'var(--accent)', fontFamily: 'var(--mono)' }}>{qualify(m.query_class, m.query_function)}</span>
             <span style={{ color: 'var(--txt3)', flexShrink: 0 }}>≈</span>
-            <span style={{ color: 'var(--green)', fontFamily: 'var(--mono)' }}>{m.matched_function}</span>
+            <span style={{ color: 'var(--green)', fontFamily: 'var(--mono)' }}>{qualify(m.matched_class, m.matched_function)}</span>
+            <span style={{
+              fontSize: 9, letterSpacing: '0.04em', textTransform: 'uppercase',
+              color: 'var(--txt3)', border: '1px solid var(--border2)',
+              borderRadius: 3, padding: '1px 5px', flexShrink: 0,
+            }}>
+              {moduleLevel ? 'module' : 'class'}
+            </span>
           </div>
           <div style={{ fontSize: 10, color: 'var(--txt3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {m.query_file} → <strong style={{ color: 'var(--txt2)' }}>{m.matched_repo}</strong>:{m.matched_file}
@@ -315,11 +330,11 @@ function CorpusMatchCard({ m, index }) {
       {expanded && (
         <div style={{ borderTop: '1px solid var(--border)', padding: '12px 14px' }}>
           <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-            <CodePanel label={`this repo — ${m.query_function}`} lines={m.query_lines} code={m.query_code} accent="var(--accent)" />
+            <CodePanel label={`this repo — ${qualify(m.query_class, m.query_function)}`} lines={m.query_lines} code={m.query_code} accent="var(--accent)" />
             <div style={{ width: 28, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', paddingTop: 30 }}>
               <span style={{ fontSize: 14, color: simColor(m.similarity) }}>≈</span>
             </div>
-            <CodePanel label={`${m.matched_repo} — ${m.matched_function}`} lines={m.matched_lines} code={m.matched_code} accent="var(--green)" />
+            <CodePanel label={`${m.matched_repo} — ${qualify(m.matched_class, m.matched_function)}`} lines={m.matched_lines} code={m.matched_code} accent="var(--green)" />
           </div>
         </div>
       )}
