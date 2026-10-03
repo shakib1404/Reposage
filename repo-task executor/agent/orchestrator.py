@@ -100,8 +100,12 @@ class AgentOrchestrator:
             changes, test_result = self._generate_and_test_loop(task, ctx, result)
 
             result.test_result = test_result
-            result.changed_files = changes.all_changed_paths()
-            result.explanation = changes.explanation
+            # result.changed_files / result.explanation are filled in by the
+            # loop itself: they accumulate across attempts. `changes` is only
+            # the LAST attempt's reply, which is empty whenever an earlier
+            # attempt already fixed the code — reading the changed paths off it
+            # threw that fix away and skipped the push.
+            changed_paths = result.changed_files
 
             if not test_result.passed and self.run_tests:
                 result.error = "Max retries exhausted; tests still failing."
@@ -116,7 +120,7 @@ class AgentOrchestrator:
             # always fails — that's not a real failure, it's an expected
             # no-op outcome, so skip the push/PR step entirely instead of
             # letting it blow up into a reported task failure.
-            if not changes.all_changed_paths():
+            if not changed_paths:
                 log.info("No file changes were needed — nothing to commit or push.")
                 result.success = True
                 log.section(f"DONE — no changes needed for: {task[:60]}")
@@ -127,8 +131,8 @@ class AgentOrchestrator:
             pr_agent = GitHubPRAgent(self.workspace_dir, github_url)
             branch = pr_agent.commit_and_push(
                 task=task,
-                changed_paths=changes.all_changed_paths(),
-                explanation=changes.explanation,
+                changed_paths=changed_paths,
+                explanation=result.explanation,
             )
             result.branch_name = branch
 
@@ -136,7 +140,7 @@ class AgentOrchestrator:
                 pr_url = pr_agent.create_pr(
                     branch_name=branch,
                     task=task,
-                    explanation=changes.explanation,
+                    explanation=result.explanation,
                     test_summary=test_result.short_summary(),
                     base_branch=default_branch,
                 )
@@ -171,6 +175,11 @@ class AgentOrchestrator:
         previous_error: str | None = None
         last_changes: CodeChanges | None = None
         last_test: TestResult | None = None
+        # Edits survive across attempts on disk, so the record of them has to
+        # survive too. Attempt 1 fixes the bug, attempt 2 sees green tests and
+        # correctly returns an empty patch — without this the run ends holding
+        # that empty patch and reports "no file changes were needed".
+        touched: list[str] = []
 
         for attempt in range(1, self.max_retries + 1):
             log.info(f"Attempt {attempt}/{self.max_retries}")
@@ -187,7 +196,13 @@ class AgentOrchestrator:
 
             # Apply changes
             log.info("Applying file changes...")
-            writer.apply(changes)
+            applied = writer.apply(changes)
+            for path in applied:
+                if path not in touched:
+                    touched.append(path)
+            if applied:
+                result.explanation = changes.explanation
+            result.changed_files = list(touched)
 
             # Run tests
             if not self.run_tests:
@@ -219,4 +234,6 @@ class AgentOrchestrator:
             ctx = reader.read(task)
 
         # All retries exhausted
+        if not result.explanation and last_changes is not None:
+            result.explanation = last_changes.explanation
         return last_changes, last_test  # type: ignore[return-value]
