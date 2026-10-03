@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Optional
 
 from bson import ObjectId
+from bson.errors import InvalidId
 from auth import get_db
 
 
@@ -47,14 +48,33 @@ async def history_create(user_id: str, task: str, repos: list) -> str:
 
 
 # ── Update ────────────────────────────────────────────────────────────────────
-async def history_update(history_id: str, user_id: str, **fields) -> None:
-    """Partial update.  Pass any subset of fields to merge."""
+def _oid(value: str):
+    """ObjectId or None. A malformed id is a lookup miss, not a server error —
+    `ObjectId("not-an-objectid")` raises InvalidId, which reached the client as
+    a 500 on every history route."""
+    try:
+        return ObjectId(value)
+    except (InvalidId, TypeError):
+        return None
+
+
+async def history_update(history_id: str, user_id: str, **fields) -> bool:
+    """Partial update. Pass any subset of fields to merge.
+
+    Returns whether a document owned by this user actually matched, so the
+    route can 404 instead of reporting "updated" for an entry that does not
+    exist or belongs to someone else.
+    """
+    hid, uid = _oid(history_id), _oid(user_id)
+    if hid is None or uid is None:
+        return False
     db = get_db()
     fields["updated_at"] = datetime.utcnow()
-    await db["history"].update_one(
-        {"_id": ObjectId(history_id), "user_id": ObjectId(user_id)},
+    result = await db["history"].update_one(
+        {"_id": hid, "user_id": uid},
         {"$set": fields},
     )
+    return result.matched_count > 0
 
 
 # ── Read ──────────────────────────────────────────────────────────────────────
@@ -71,21 +91,21 @@ async def history_list(user_id: str, limit: int = 20) -> list[dict]:
 
 
 async def history_get(history_id: str, user_id: str) -> Optional[dict]:
+    hid, uid = _oid(history_id), _oid(user_id)
+    if hid is None or uid is None:
+        return None
     db  = get_db()
-    doc = await db["history"].find_one({
-        "_id":     ObjectId(history_id),
-        "user_id": ObjectId(user_id),
-    })
+    doc = await db["history"].find_one({"_id": hid, "user_id": uid})
     return _serialize(doc) if doc else None
 
 
 # ── Delete ────────────────────────────────────────────────────────────────────
 async def history_delete(history_id: str, user_id: str) -> bool:
+    hid, uid = _oid(history_id), _oid(user_id)
+    if hid is None or uid is None:
+        return False
     db     = get_db()
-    result = await db["history"].delete_one({
-        "_id":     ObjectId(history_id),
-        "user_id": ObjectId(user_id),
-    })
+    result = await db["history"].delete_one({"_id": hid, "user_id": uid})
     return result.deleted_count > 0
 
 

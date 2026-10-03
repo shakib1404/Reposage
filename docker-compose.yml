@@ -17,6 +17,10 @@ services:
       # Copy Detector corpus (faiss index + metadata). Must live on the volume:
       # its default is $HOME inside the image, which a restart throws away.
       CORPUS_ROOT: /data/outputs/corpus
+      # Wheel cache for the audit's per-repo venv and the executor's dependency
+      # installs. On the volume so it survives restarts; without it every audit
+      # re-downloads ~465MB of scanners (56.4s vs 10.6s once warm).
+      PIP_CACHE_DIR: /data/outputs/pipcache
       # Where RepoTask Executor clones repos. Must be writable and is
       # deliberately on the outputs volume, not in the read-only /opt package.
       REPO_TASK_WORKSPACE_ROOT: /data/outputs/taskexec

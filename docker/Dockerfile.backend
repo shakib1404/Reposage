@@ -28,8 +28,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tk \
     && rm -rf /var/lib/apt/lists/*
 
+# PIP_NO_CACHE_DIR is deliberately NOT set here. It keeps the image small, but
+# an ENV applies at RUN time too, and at run time the audit creates a fresh venv
+# per repo and pip-installs seven scanners (ruff, bandit, pip-audit, mypy,
+# detect-secrets, vulture, semgrep — ~465MB) into it. With the cache disabled
+# every audit re-downloads all of it from PyPI: measured 56.4s, against 10.6s
+# once a cache is warm. Note that PIP_NO_CACHE_DIR=0 does NOT re-enable it —
+# pip reads any value as true — so the variable has to be absent, and the build
+# layers below pass --no-cache-dir explicitly instead.
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HOME=/opt/hf \
     SENTENCE_TRANSFORMERS_HOME=/opt/hf
@@ -46,10 +53,10 @@ WORKDIR /app
 # the CPU wheel up front makes the requirements install below a no-op for
 # torch and takes the image from ~5GB down to well under 1.5GB — the
 # difference between needing an expensive droplet and a cheap one.
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 COPY backend/requirements.txt ./requirements.txt
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # The RepoTask Executor is a separate agent package that main.py launches as a
 # subprocess. It is NOT under backend/, so the `COPY backend/ /app/` below does
@@ -62,7 +69,7 @@ COPY ["repo-task executor/requirements.txt", "/tmp/rte-requirements.txt"]
 # has no Docker CLI, so it always takes the LOCAL fallback — which installs
 # nothing. Without pytest here the agent applies its fix correctly and then
 # reports FAILED because it cannot run the tests that would prove the fix.
-RUN pip install -r /tmp/rte-requirements.txt pytest \
+RUN pip install --no-cache-dir -r /tmp/rte-requirements.txt pytest \
     && rm /tmp/rte-requirements.txt
 
 # Bake the two sentence-transformers models search.py loads into the image.

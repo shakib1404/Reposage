@@ -1,5 +1,6 @@
 """RepoSage backend — FastAPI"""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import mimetypes
 import os
@@ -237,7 +238,12 @@ async def create_history_entry(req: HistoryCreateRequest,
 async def update_history_entry(history_id: str, req: HistoryUpdateRequest,
                                 user: dict = Depends(get_current_user)):
     fields = {k: v for k, v in req.model_dump().items() if v is not None}
-    await history_update(history_id, user["_id"], **fields)
+    # Without this the route answered "updated" for an id that does not exist,
+    # for a malformed id, and for another user's entry — the write was always
+    # correctly scoped, but the response said otherwise.
+    updated = await history_update(history_id, user["_id"], **fields)
+    if not updated:
+        raise HTTPException(404, "History entry not found")
     return {"status": "updated"}
 
 
@@ -446,9 +452,29 @@ async def execute(req: ExecuteRequest,
 
 
 # ── Output files ─────────────────────────────────────────────────────────────
+
+def _job_dir(job_id: str) -> Path:
+    """Resolve a job directory, refusing anything that escapes OUTPUT_ROOT.
+
+    `job_id` arrives straight from the URL and used to be joined unchecked.
+    A single `..` was enough to step out: `GET /api/outputs/..` resolved to
+    OUTPUT_ROOT's parent and passed the is_dir() gate, and DELETE builds the
+    same path before calling shutil.rmtree — so that one request would have
+    taken out every job's output *and* the Copy Detector corpus, with no
+    authentication required.
+    """
+    root = Path(OUTPUT_ROOT).resolve()
+    candidate = (root / job_id).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise HTTPException(404, "Job not found")
+    if candidate == root:
+        raise HTTPException(404, "Job not found")
+    return candidate
+
+
 @app.get("/api/outputs/{job_id}")
 async def list_outputs(job_id: str):
-    job_dir = Path(OUTPUT_ROOT) / job_id
+    job_dir = _job_dir(job_id)
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found")
     files = []
@@ -462,7 +488,7 @@ async def list_outputs(job_id: str):
 @app.get("/api/outputs/{job_id}/{filename:path}")
 async def download_output(job_id: str, filename: str):
     safe_name = Path(filename).name
-    file_path = Path(OUTPUT_ROOT) / job_id / safe_name
+    file_path = _job_dir(job_id) / safe_name
     if not file_path.is_file():
         raise HTTPException(404, "File not found")
     mime, _ = mimetypes.guess_type(str(file_path))
@@ -474,7 +500,7 @@ async def download_output(job_id: str, filename: str):
 
 @app.delete("/api/outputs/{job_id}")
 async def delete_outputs(job_id: str):
-    job_dir = Path(OUTPUT_ROOT) / job_id
+    job_dir = _job_dir(job_id)
     if not job_dir.is_dir():
         raise HTTPException(404, "Job not found")
     shutil.rmtree(str(job_dir), ignore_errors=True)
@@ -735,10 +761,33 @@ async def copy_detect(req: CopyDetectRequest,
 
         def _run() -> None:
             try:
-                with (
-                    Repository.load(req.test_repo) as test_repo,
-                    Repository.load(req.source_repo) as source_repo,
-                ):
+                # Clone both repos at once. Repository.__enter__ is what runs
+                # `git clone`, and `with (A as a, B as b)` enters them one after
+                # the other — but cloning is 70-85% of a run (2.5s of 2.9s on a
+                # small fork pair), so serialising two independent network
+                # fetches doubles the part of the wait that dominates. Each
+                # instance only touches its own _tempdir/_entries/root_path, so
+                # entering two of them concurrently is safe.
+                cms = [Repository.load(req.test_repo), Repository.load(req.source_repo)]
+                opened: dict = {}
+                clone_exc: Optional[BaseException] = None
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = {pool.submit(cm.__enter__): cm for cm in cms}
+                    for fut, cm in futures.items():
+                        try:
+                            opened[id(cm)] = fut.result()
+                        except BaseException as exc:          # noqa: BLE001
+                            clone_exc = clone_exc or exc
+                if clone_exc is not None:
+                    # One clone may still have succeeded; its temp dir must go.
+                    for cm in cms:
+                        if id(cm) in opened:
+                            cm.__exit__(None, None, None)
+                    raise clone_exc
+
+                test_repo   = opened[id(cms[0])]
+                source_repo = opened[id(cms[1])]
+                try:
                     loop.call_soon_threadsafe(
                         queue.put_nowait,
                         {"type": "status", "message": "Repos loaded. Starting detection…"},
@@ -779,6 +828,9 @@ async def copy_detect(req: CopyDetectRequest,
                         queue.put_nowait,
                         {"type": "done", "total_detections": count},
                     )
+                finally:
+                    for cm in reversed(cms):
+                        cm.__exit__(None, None, None)
 
             except VendetectRuntimeError as e:
                 loop.call_soon_threadsafe(

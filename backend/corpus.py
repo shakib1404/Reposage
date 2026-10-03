@@ -45,6 +45,29 @@ EMBED_DIM = 384   # all-MiniLM-L6-v2 output size
 DEFAULT_MATCH_THRESHOLD = 0.75
 DEFAULT_TOP_K = 5   # nearest corpus neighbors to consider per query function
 
+# Functions this short carry no evidence of copying, and they actively produce
+# false attribution: `def __len__(self): return len(self.data)` embeds
+# identically no matter who wrote it, so it matches at 1.000 across unrelated
+# repos and inflates the repo-level summary. Measured on this corpus (5 repos,
+# 1658 functions) against three known forks: requiring >3 non-blank lines
+# removed all 18 off-target matches — psf/requests and pyecharts stopped being
+# credited for uQR's and Python-Maze's dunder methods — while keeping 125 of
+# 155 true-source matches, with the correct source still ranked first and
+# unopposed in all three cases.
+#
+# Only the corpus mode uses this. Self-scan (dupdetect) deliberately keeps
+# short functions: within ONE repo, a repeated 2-line helper is a real finding.
+MIN_FUNCTION_LINES = int(os.environ.get("CORPUS_MIN_FUNCTION_LINES", "4"))
+
+
+def _code_lines(code: str) -> int:
+    """Non-blank lines, which is what "too small to be evidence" means here."""
+    return sum(1 for ln in (code or "").splitlines() if ln.strip())
+
+
+def _is_substantial(code: str) -> bool:
+    return _code_lines(code) >= MIN_FUNCTION_LINES
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Repo identity
@@ -134,7 +157,13 @@ async def _clone_and_extract(repo_ref: str):
         rel = os.path.relpath(fp, workspace)
         all_funcs += _extract_functions(rel, src)
 
-    yield ("__RESULT__", tmp_dir, all_funcs)
+    # One gate for both callers, so a repo is indexed on exactly the same terms
+    # it is later searched on.
+    kept = [f for f in all_funcs if _is_substantial(f.code)]
+    if len(kept) != len(all_funcs):
+        log.info("corpus: skipped %d/%d functions under %d lines",
+                 len(all_funcs) - len(kept), len(all_funcs), MIN_FUNCTION_LINES)
+    yield ("__RESULT__", tmp_dir, kept)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -250,6 +279,11 @@ async def search_corpus(
                 m = metadata[idx]
                 if m["repo"] == query_repo:
                     continue   # skip self-matches if this repo is itself already in the corpus
+                if not _is_substantial(m.get("code", "")):
+                    # An index built before MIN_FUNCTION_LINES existed still holds
+                    # two-line dunders. The index persists across upgrades, so the
+                    # gate has to hold on the stored side too, not just on input.
+                    continue
                 match_count += 1
                 per_repo[m["repo"]].append(float(sim))
                 yield {

@@ -11,7 +11,8 @@
 # Required in .env (or the shell) next to this file:
 #   DOCKERHUB_USER=yourdockerhubusername
 # Optional:
-#   TAG=v1          (defaults to "latest")
+#   TAG=v2          (defaults to "latest"; v1 is the previous build, kept
+#                   published so TAG=v1 + restart is a one-line rollback)
 #   SITE_ADDRESS=:80 or your domain, for TLS
 #
 # Everything else — mem limits, tmpfs, volumes — matches docker-compose.yml.
@@ -34,6 +35,10 @@ services:
       # Copy Detector corpus (faiss index + metadata). Must live on the volume:
       # its default is $HOME inside the image, which a restart throws away.
       CORPUS_ROOT: /data/outputs/corpus
+      # Wheel cache for the audit's per-repo venv and the executor's dependency
+      # installs. On the volume so it survives restarts; without it every audit
+      # re-downloads ~465MB of scanners (56.4s vs 10.6s once warm).
+      PIP_CACHE_DIR: /data/outputs/pipcache
       REPO_TASK_WORKSPACE_ROOT: /data/outputs/taskexec
       CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-}
     volumes:
