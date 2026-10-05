@@ -613,11 +613,9 @@ async def run_execution_loop(
             # the wrong-entry-point mistake this gate exists to send back round
             # the loop, so a named artefact is now required either way.
             unmet = []
-            unmet_detail: list[tuple[str, str]] = []
             if final_rc == 0 and expected_artifacts:
-                unmet_detail = _missing_artifacts_detail(expected_artifacts, workspace,
-                                                         pre_run_files)
-                unmet = [e for e, _ in unmet_detail]
+                unmet = _missing_artifacts(expected_artifacts, workspace,
+                                           pre_run_files)
             install_only = final_rc == 0 and _is_install_only(run_cmd)
 
             if final_rc == 0 and not unmet and not install_only:
@@ -640,20 +638,12 @@ async def run_execution_loop(
                           tool="feedback.loop", metrics=metrics)
             elif unmet:
                 error_class = "missing_artifact"
-                # Say WHY each file failed the gate, not just that it did: a
-                # file that exists but fails its format check needs a different
-                # fix than one that was never written, and handing the model
-                # the same "never created" line for both used to send it
-                # inventing an unrelated cause (a missing input, a wrong
-                # directory) while it rewrote the same working command under a
-                # cosmetic quoting change every attempt.
-                reasons = "; ".join(f"{e} — {why}" for e, why in unmet_detail)
-                gap = ("The command exited 0 but the task's output file(s) did "
-                       f"not satisfy the task: {reasons}. Fix the actual gap "
-                       "named above, not the exit code.")
+                gap = ("The command exited 0 but the task's output file(s) were "
+                       f"never created: {', '.join(unmet)}. The run did not "
+                       "actually perform the task.")
                 run_output = gap + "\n\n" + run_output
                 yield _ev("feedback",
-                          f"Attempt {attempt + 1} exited 0 but the output file(s) did not qualify",
+                          f"Attempt {attempt + 1} exited 0 but produced no output file",
                           gap,
                           code=_clip(run_output, 3000, 900),
                           tool="feedback.loop", metrics=metrics)
@@ -3120,35 +3110,17 @@ def _is_json(b: bytes, truncated: bool = False) -> bool:
     Parsing a prefix always fails, so reading only the head would reject every
     large-but-valid JSON — a 39MB data.json written by a perfectly good run was
     the case that caught this.
-
-    JSON Lines (one JSON value per line, no enclosing array) is accepted too.
-    It is exactly what pandas' to_json(..., lines=True) writes, and a repo
-    asked to convert a CSV reached for that form; rejecting it as "not JSON"
-    sent the self-healing loop in circles re-running a command that already
-    worked, seven times, under a different cosmetic diagnosis each attempt,
-    because json.loads() on the whole file never passed no matter what the
-    quoting looked like.
     """
     head = b.lstrip()[:1]
     if head not in (b"{", b"["):
         return False
     if truncated:
         return True
-    text = b.decode("utf-8", "ignore")
     try:
-        json.loads(text)
+        json.loads(b.decode("utf-8", "ignore"))
         return True
     except Exception:
-        pass
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    if len(lines) < 2:
         return False
-    try:
-        for ln in lines:
-            json.loads(ln)
-    except Exception:
-        return False
-    return True
 
 
 def _is_png(b: bytes) -> bool:
@@ -3191,54 +3163,28 @@ def _wrong_format(path: Path, name: str) -> bool:
     present, gate satisfied, and not one HTML tag in it. An empty file counts
     as wrong too; a zero-byte PNG is not a PNG.
     """
-    return _format_problem(path, name) is not None
-
-
-def _format_problem(path: Path, name: str) -> str | None:
-    """Why `_wrong_format` rejected the file, or None if it did not.
-
-    `_wrong_format` collapses every rejection to one bit, so the retry loop
-    could only ever tell the model "the file was never created" — even when it
-    plainly existed and only failed its format check. That false "missing"
-    report sent a diagnosis model hunting for a reason the output never
-    appeared (a missing input file, a wrong working directory) instead of the
-    real, fixable gap, and a run that reproduced correct data on attempt 2
-    still burned every remaining retry on cosmetic rewrites of a command that
-    already worked.
-    """
     check = _FORMAT_CHECKS.get(Path(name).suffix.lower())
     if check is None:
-        return None
+        return False
     LIMIT = 4_000_000
     try:
         size = path.stat().st_size
         with path.open("rb") as fh:
             head = fh.read(LIMIT)
     except OSError:
-        return None
+        return False
     if not head.strip():
-        return "the file is empty"
+        return True                       # a zero-byte PNG is not a PNG
     truncated = size > LIMIT
     try:
-        ok = check(head, truncated)
+        return not check(head, truncated)
     except TypeError:                     # magic-byte checks take bytes only
-        ok = check(head)
-    if ok:
-        return None
-    return f"the file exists but its content is not valid {Path(name).suffix.lstrip('.').upper()}"
+        return not check(head)
 
 
 def _missing_artifacts(expected: list[str], workspace: str,
                        pre_run_files: set[str] | None = None) -> list[str]:
-    """Which expected artifacts the run did not produce, or produced wrongly."""
-    return [e for e, _ in _missing_artifacts_detail(expected, workspace, pre_run_files)]
-
-
-def _missing_artifacts_detail(expected: list[str], workspace: str,
-                              pre_run_files: set[str] | None = None,
-                              ) -> list[tuple[str, str]]:
-    """Which expected artifacts the run did not produce, or produced wrongly,
-    paired with WHY — "never created" or the specific format problem.
+    """Which expected artifacts the run did not produce, or produced wrongly.
 
     Matched on basename anywhere in the tree, because a script that honours the
     task but writes ./maze.png instead of ./outputs/maze.png has still done the
@@ -3246,10 +3192,8 @@ def _missing_artifacts_detail(expected: list[str], workspace: str,
     maze_solution.png at its root, and a repo shipping the very name the task
     asks for must not be able to satisfy the task by doing nothing.
 
-    The reason matters downstream: a run that wrote the file but failed its
-    format check used to be reported to the diagnosis model identically to one
-    that wrote nothing at all ("never created"), which sent it looking for the
-    wrong kind of bug entirely.
+    A file whose contents contradict its extension counts as missing — see
+    _wrong_format.
     """
     if not expected:
         return []
@@ -3271,12 +3215,8 @@ def _missing_artifacts_detail(expected: list[str], workspace: str,
     for e in expected:
         base = os.path.basename(e).lower()
         hit = produced.get(base)
-        if hit is None:
-            unmet.append((e, "never created"))
-            continue
-        problem = _format_problem(hit, base)
-        if problem is not None:
-            unmet.append((e, problem))
+        if hit is None or _wrong_format(hit, base):
+            unmet.append(e)
     return unmet
 
 

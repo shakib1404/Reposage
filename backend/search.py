@@ -109,7 +109,7 @@ async def search_repos(task: str, limit: int = RESULT_LIMIT) -> dict:
     """
     Returns {"repos": [...], "suggestions": [...], "query": "<canonical>"}.
 
-    (Historically this returned a bare list of 3 repos. It now returns the
+    (Historically this returned a bare list of 9 repos. It now returns the
     richer envelope so the UI can render the "refine your search" chips and
     show what the raw task was actually normalized to.)
     """
