@@ -83,7 +83,18 @@ async def warm_db():
     # 3. Warm the search reranker — loading the cross-encoder takes ~9s, and
     #    paying that inside the first user's search made it feel broken.
     #    Runs in a thread so it never blocks startup or the event loop.
+    #
+    #    On a memory-capped deployment (e.g. a 1GB Railway service) this model
+    #    holds ~400-500MB resident for the life of the process — on top of
+    #    that, the audit endpoint spins up a venv and installs/runs several
+    #    scanners, and the combination is what was tipping the container over
+    #    its limit and getting OOM-killed. SKIP_RERANKER_WARMUP defers loading
+    #    to the first real search instead of eager-loading at boot, so a
+    #    freshly started process has the headroom an audit needs; search just
+    #    pays the ~9s load cost on its first call instead of at startup.
     async def _warm_reranker():
+        if os.getenv("SKIP_RERANKER_WARMUP", "").strip().lower() in ("1", "true", "yes"):
+            return
         try:
             from search import warm_models
             await _asyncio.to_thread(warm_models)

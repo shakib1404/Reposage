@@ -714,6 +714,23 @@ def _get_reranker():
     return _reranker
 
 
+def release_reranker() -> None:
+    """Free the resident cross-encoder (~400-500MB) if one is loaded.
+
+    A search loads this lazily and it then stays resident for the rest of
+    the process's life — fine normally, but on a memory-capped deployment a
+    search that ran earlier in the same process leaves no headroom for the
+    audit endpoint's venv-plus-scanners spike, and the container gets
+    OOM-killed. The audit calls this first so it always starts from a known
+    low baseline; the next search just re-pays the one-time load cost.
+    """
+    global _reranker
+    if _reranker is not None:
+        _reranker = None
+        import gc
+        gc.collect()
+
+
 def _repo_text(r: dict) -> str:
     """
     Text the cross-encoder judges the query against.

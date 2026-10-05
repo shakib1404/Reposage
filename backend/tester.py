@@ -176,6 +176,19 @@ async def run_test_loop(
     all_findings: list[dict] = []
     t_start = time.monotonic()
 
+    # On a memory-capped deployment a prior search leaves the cross-encoder
+    # reranker (~400-500MB) resident for the rest of the process's life,
+    # which left no headroom for this function's venv-plus-scanners memory
+    # spike and got the container OOM-killed. Gated the same way as the
+    # eager-warmup skip: both are signals this process is running somewhere
+    # memory-constrained, not the default self-hosted deployment.
+    if os.getenv("SKIP_RERANKER_WARMUP", "").strip().lower() in ("1", "true", "yes"):
+        try:
+            from search import release_reranker
+            release_reranker()
+        except Exception:
+            pass
+
     try:
         # ── 1. Clone ─────────────────────────────────────────────────────────
         yield _ev("status", "Cloning repository",
@@ -248,6 +261,13 @@ async def run_test_loop(
                 log.warning("Scanner %s failed: %s", sid, exc)
                 yield _ev("scanner_error", meta["name"], str(exc)[:300],
                           scanner=sid, icon=meta["icon"], findings=[])
+
+            # Each scanner's subprocess output (sometimes large JSON) and
+            # intermediate parsing data goes out of scope here; collecting
+            # now instead of waiting for the next allocation keeps this
+            # process's own footprint from ratcheting up over 9 scanners.
+            import gc
+            gc.collect()
 
         # ── 4b. Attach the offending source lines ─────────────────────────────
         # Must happen HERE, before the `finally` below deletes the clone: a
@@ -601,9 +621,16 @@ async def _scan_semgrep(workspace: str, venv_path: str) -> list[dict]:
     # NOTE: --config auto requires metrics to stay on — Semgrep uses that
     # ping to pick the curated ruleset for the repo; passing --metrics=off
     # (or SEMGREP_SEND_METRICS=off) makes "auto" fail outright.
+    # Semgrep defaults -j to the CPU count, running that many rule-matching
+    # workers in parallel — each one a real memory cost, not just a speed
+    # knob. On a memory-capped deployment (SEMGREP_JOBS set) that parallelism
+    # is what was pushing an already near-the-limit container into an OOM
+    # kill; trading speed for a single worker keeps peak memory down.
+    jobs = os.getenv("SEMGREP_JOBS", "").strip()
+    jobs_args = ["--jobs", jobs] if jobs else []
     ok, out = await _run(
         [semgrep, "--config", "auto", "--json", "--quiet",
-         "--disable-version-check", "."],
+         "--disable-version-check", *jobs_args, "."],
         workspace, timeout=SEMGREP_TIMEOUT)
     findings = []
     sev_map = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}

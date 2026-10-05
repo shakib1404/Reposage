@@ -1,4 +1,7 @@
-const BASE = '/api'
+// In the single-origin Docker deployment Caddy proxies /api to the backend,
+// so a relative path works. Split across origins (Vercel + Railway) there is
+// no same-origin proxy, so VITE_API_URL must point at the backend's own URL.
+const BASE = (import.meta.env.VITE_API_URL || '') + '/api'
 
 // ── Auth token helpers ────────────────────────────────────────────────────────
 export const getToken  = ()      => localStorage.getItem('rm_token') || ''
