@@ -28,7 +28,6 @@ const MUTED  = [138, 141, 153]
 const FAINT  = [226, 227, 232]
 const WASH   = [247, 247, 250]
 const ACCENT = [79, 107, 237]
-const DARK   = [17, 18, 23]
 const PAPER  = [255, 255, 255]
 
 const SEV_RGB = {
@@ -498,132 +497,90 @@ export function downloadAuditReport(report) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Cover
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * A title page, not a dashboard tile. The previous cover packed a full-width
+ * 100mm band, a cornered grade box and four side-by-side tiles into the top
+ * third of the sheet — a composition built for a landscape slide, stretched
+ * over a portrait page. Every number it showed is also in the body (sections
+ * 3-7), so the fix is to let the cover be what a professional report's first
+ * page actually is: title, one strong vertical focal point, and a close.
+ */
 function cover(L, report, groups) {
   const { doc } = L
-  const BAND = 100
-
-  doc.setFillColor(...DARK)
-  doc.rect(0, 0, PW, BAND, 'F')
-  doc.setFillColor(...ACCENT)
-  doc.rect(0, BAND - 1.1, PW, 1.1, 'F')
-
-  L.set(7.2, 'bold', [150, 170, 255])
-  doc.text('CODE AUDIT REPORT', M, 20)
-
-  L.set(21, 'bold', [252, 252, 255])
-  let ty = 35
-  for (const ln of doc.splitTextToSize(enc(report.repo || 'repository'), CW - 50).slice(0, 2)) {
-    doc.text(ln, M, ty); ty += 9.5
-  }
-  L.set(8.4, 'normal', [152, 156, 172])
-  doc.text(enc(`Static analysis by ${SCANNERS.length} scanners  ·  ` +
-                `${(report.findings || []).length} findings  ·  ` +
-                `${groups.length} issue types`), M, ty)
-  L.set(7.4, 'normal', [108, 112, 130])
-  doc.text(enc(`Generated ${new Date().toLocaleString()}`), M, ty + 5.4)
-
-  // Grade medallion
   const g = report.grade || 'F'
-  doc.setFillColor(...(GRADE_RGB[g] || MUTED))
-  doc.roundedRect(PW - M - 38, 22, 38, 38, 3, 3, 'F')
-  L.set(26, 'bold', PAPER)
-  doc.text(enc(g), PW - M - 19, 44, { align: 'center' })
-  L.set(8.2, 'bold', PAPER)
-  doc.text(enc(`${report.score}/100`), PW - M - 19, 53, { align: 'center' })
+  const gradeRgb = GRADE_RGB[g] || MUTED
+  const band = GRADE_BANDS.find(b => b[0] === g)
 
-  // Headline numbers, inside the band — the band is the strongest element on
-  // the page and leaving its lower half empty made the cover look unfinished.
-  const tiles = [
+  // A hairline, not a hero band — the only colour at the very top of the page.
+  doc.setFillColor(...ACCENT)
+  doc.rect(0, 0, PW, 2.2, 'F')
+
+  let y = 44
+  L.set(8.4, 'bold', ACCENT)
+  doc.text(enc('C O D E   A U D I T   R E P O R T'), M, y)
+  y += 5
+  doc.setDrawColor(...ACCENT)
+  doc.setLineWidth(0.8)
+  doc.line(M, y, M + 16, y)
+  y += 15
+
+  L.set(28, 'bold', INK)
+  const titleLines = doc.splitTextToSize(enc(report.repo || 'repository'), CW).slice(0, 3)
+  for (const ln of titleLines) { doc.text(ln, M, y); y += 11 }
+  y += 3
+
+  L.set(9.2, 'normal', MUTED)
+  doc.text(enc(
+    `Static analysis across ${SCANNERS.length} scanners  ·  ` +
+    `${(report.findings || []).length} findings  ·  ${groups.length} issue types`
+  ), M, y)
+  y += 6
+  L.set(7.6, 'normal', [152, 155, 168])
+  doc.text(enc(`Generated ${new Date().toLocaleString()}`), M, y)
+  y += 9
+
+  doc.setDrawColor(...FAINT)
+  doc.setLineWidth(0.2)
+  doc.line(M, y, PW - M, y)
+
+  // ── The seal: the single focal point, centred, reading top to bottom ──────
+  const cy = 158, r = 26
+  doc.setFillColor(...tint(gradeRgb, 0.9))
+  doc.circle(PW / 2, cy, r + 4, 'F')
+  doc.setFillColor(...gradeRgb)
+  doc.circle(PW / 2, cy, r, 'F')
+  L.set(32, 'bold', PAPER)
+  doc.text(enc(g), PW / 2, cy + 6, { align: 'center' })
+
+  L.set(10.5, 'bold', INK)
+  doc.text(enc(`${report.score} / 100`), PW / 2, cy + r + 12, { align: 'center' })
+  if (band) {
+    L.set(8, 'normal', MUTED)
+    let by_ = cy + r + 19
+    for (const ln of doc.splitTextToSize(enc(band[2]), 112)) {
+      doc.text(ln, PW / 2, by_, { align: 'center' }); by_ += 4.2
+    }
+  }
+
+  // ── Headline numbers, as a quiet caption row — not boxed tiles ────────────
+  const statsY = 233
+  const stats = [
     [String((report.findings || []).length), 'TOTAL FINDINGS'],
     [String(report.graded_on ?? (report.findings || []).length), 'GRADED (SOURCE)'],
     [(report.source_loc || 0).toLocaleString(), 'LINES OF SOURCE'],
     [`${report.elapsed_s || 0}s`, 'SCAN TIME'],
   ]
-  const tw = (CW - 3 * 3) / 4
-  tiles.forEach(([v, k], i) => {
-    const x = M + i * (tw + 3)
-    doc.setFillColor(31, 33, 41)
-    doc.roundedRect(x, BAND - 31, tw, 22, 1.5, 1.5, 'F')
-    L.set(13, 'bold', [248, 248, 252])
-    doc.text(enc(v), x + tw / 2, BAND - 20, { align: 'center' })
-    L.set(5.8, 'normal', [128, 132, 150])
-    doc.text(enc(k), x + tw / 2, BAND - 14, { align: 'center' })
+  const sw = CW / stats.length
+  doc.setDrawColor(...FAINT)
+  doc.setLineWidth(0.2)
+  stats.forEach(([v, k], i) => {
+    const x = M + i * sw + sw / 2
+    L.set(13, 'bold', INK)
+    doc.text(enc(v), x, statsY, { align: 'center' })
+    L.set(6, 'normal', MUTED)
+    doc.text(enc(k), x, statsY + 4.6, { align: 'center' })
+    if (i > 0) doc.line(M + i * sw, statsY - 7.5, M + i * sw, statsY + 5.4)
   })
-
-  // ── At a glance ───────────────────────────────────────────────────────────
-  L.y = BAND + 14
-  L.label('At a glance')
-  const p = prose(report, groups)
-  L.para(p[0], { size: 9, lead: 4.8, color: INK })
-  L.para(p[1], { size: 8.3, lead: 4.3 })
-  if (p[2]) L.para(p[2], { size: 8.3, lead: 4.3 })
-
-  // ── Graded severity, as one bar ───────────────────────────────────────────
-  const sev = report.severity || {}
-  const sevTotal = SEV_ORDER.reduce((a, k) => a + (sev[k] || 0), 0)
-  if (sevTotal > 0) {
-    L.y += 1
-    L.label('Severity of graded findings')
-    let x = M
-    for (const k of SEV_ORDER) {
-      const w = ((sev[k] || 0) / sevTotal) * CW
-      if (w <= 0) continue
-      doc.setFillColor(...SEV_RGB[k])
-      doc.rect(x, L.y - 2, w, 5.5, 'F')
-      x += w
-    }
-    L.y += 8
-    let lx = M
-    for (const k of SEV_ORDER) {
-      if (!(sev[k] || 0)) continue
-      doc.setFillColor(...SEV_RGB[k])
-      doc.circle(lx + 1.3, L.y - 1.3, 1.3, 'F')
-      L.set(7, 'bold', INK)
-      doc.text(enc(String(sev[k])), lx + 4, L.y)
-      const nw = doc.getTextWidth(enc(String(sev[k])))
-      L.set(7, 'normal', MUTED)
-      doc.text(enc(k), lx + 5.4 + nw, L.y)
-      lx += 5.4 + nw + doc.getTextWidth(enc(k)) + 7
-    }
-    L.y += 8
-  }
-
-  // ── Scanner tally ─────────────────────────────────────────────────────────
-  const by = report.by_scanner || {}
-  L.label('Findings by scanner')
-  const colW = CW / 3
-  SCANNERS.forEach((s, i) => {
-    const col = i % 3, row = Math.floor(i / 3)
-    const x = M + col * colW, y = L.y + row * 5.8
-    L.set(7, 'normal', s.own ? ACCENT : [78, 80, 92])
-    doc.text(enc(s.name), x, y)
-    L.set(7, 'bold', (by[s.id] || 0) > 0 ? INK : [188, 190, 198])
-    doc.text(enc(String(by[s.id] || 0)), x + colW - 8, y, { align: 'right' })
-  })
-  L.y += Math.ceil(SCANNERS.length / 3) * 5.8 + 2
-  L.set(6.4, 'normal', MUTED)
-  doc.text(enc('Blue = RepoSage\'s own analysis, not a wrapper around another tool. See section 9.'), M, L.y)
-  L.y += 7
-
-  // ── Highest-priority issues, if there is room for them ────────────────────
-  const picks = groups.filter(x => x.graded > 0 && x.severity !== 'info')
-                      .slice(0, 3)
-  if (picks.length && L.y < PH - 84) {
-    L.y += 2
-    L.label('Highest-priority issues')
-    for (const q of picks) {
-      const pw = L.pill(M, L.y, q.severity.toUpperCase(), SEV_RGB[q.severity] || MUTED)
-      L.set(7.2, 'bold', INK)
-      doc.text(enc(`${SC[q.scanner]?.name || q.scanner}${q.rule ? '  ' + q.rule : ''}`),
-               M + 3 + pw, L.y)
-      L.set(6.6, 'normal', MUTED)
-      doc.text(enc(`x${q.items.length}`), PW - M, L.y, { align: 'right' })
-      L.y += 3.8
-      L.set(6.8, 'normal', [96, 98, 110])
-      doc.text(doc.splitTextToSize(enc(q.message), CW - 14)[0] || '', M + 3, L.y)
-      L.y += 5.4
-    }
-  }
 
   // ── Colophon ──────────────────────────────────────────────────────────────
   // Pinned high enough that its last wrapped line still clears the footer band:

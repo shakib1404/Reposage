@@ -177,7 +177,7 @@ async def run_test_loop(
     t_start = time.monotonic()
 
     # On a memory-capped deployment a prior search leaves the cross-encoder
-    # reranker (~400-500MB) resident for the rest of the process's life,
+    # reranker (400-500MB) resident for the rest of the process's life,
     # which left no headroom for this function's venv-plus-scanners memory
     # spike and got the container OOM-killed. Gated the same way as the
     # eager-warmup skip: both are signals this process is running somewhere
