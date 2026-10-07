@@ -15,7 +15,7 @@ export default function CodeSnippet({ code, start, line, color = 'var(--red)' })
   return (
     <div style={{
       border: '1px solid var(--border)', borderRadius: 6,
-      overflow: 'hidden', background: '#0d0d10',
+      overflow: 'hidden', background: 'var(--code-bg)',
     }}>
       {code.map((text, i) => {
         const n   = first + i
@@ -23,7 +23,7 @@ export default function CodeSnippet({ code, start, line, color = 'var(--red)' })
         return (
           <div key={n} style={{
             display: 'flex', alignItems: 'flex-start',
-            background: hit ? 'rgba(248,113,113,0.10)' : 'transparent',
+            background: hit ? 'color-mix(in srgb, var(--red) 10%, transparent)' : 'transparent',
             borderLeft: `2px solid ${hit ? color : 'transparent'}`,
           }}>
             <span style={{

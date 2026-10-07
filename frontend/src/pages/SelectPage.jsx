@@ -98,7 +98,7 @@ export default function SelectPage({
           const isSel = sel?.full_name === r.full_name
           return (
             <div key={r.full_name} onClick={() => pick(r)} style={{
-              background: isSel ? 'rgba(93,142,255,0.07)' : 'var(--bg2)',
+              background: isSel ? 'color-mix(in srgb, var(--accent) 7%, transparent)' : 'var(--bg2)',
               border: `1px solid ${isSel ? 'var(--accent)' : 'var(--border)'}`,
               borderRadius: 'var(--radius-lg)', padding: '16px 18px', cursor: 'pointer',
               transition: 'all 0.15s', position: 'relative',

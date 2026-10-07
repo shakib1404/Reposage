@@ -9,6 +9,7 @@
  * here is a set of modules that genuinely depend on each other.
  */
 import { useEffect, useRef, useMemo, useState } from 'react'
+import { getTheme, useTheme, ink } from '../lib/theme'
 
 // Golden-angle hue stepping: distinct, evenly separated colours for however
 // many clusters a repo turns out to have, instead of a fixed palette of 8
@@ -25,6 +26,7 @@ export default function ClusterView({
 }) {
   const canvasRef = useRef()
   const [hover, setHover] = useState(null)
+  const theme = useTheme()
 
   // Fall back to a single implicit cluster for analyses saved before the
   // backend started emitting them, so old history entries still render.
@@ -55,7 +57,7 @@ export default function ClusterView({
     const ctx = canvas.getContext('2d')
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     draw(ctx, W, H, layout, fcgEdges, hover)
-  }, [layout, fcgEdges, hover, canvasH])
+  }, [layout, fcgEdges, hover, canvasH, theme])
 
   if (!groups.length) {
     return (
@@ -236,7 +238,7 @@ function draw(ctx, W, H, layout, fcgEdges, hover) {
 
   // Call edges between modules we actually placed.
   ctx.save()
-  ctx.strokeStyle = 'rgba(255,255,255,0.055)'
+  ctx.strokeStyle = getTheme() === 'light' ? ink(0.1) : 'rgba(255,255,255,0.055)'
   fcgEdges.slice(0, 160).forEach(e => {
     const a = pos.get(e.from) || [...pos.values()].find(n => n.short === e.from)
     const b = pos.get(e.to)   || [...pos.values()].find(n => n.short === e.to)
@@ -274,7 +276,7 @@ function draw(ctx, W, H, layout, fcgEdges, hover) {
   const labelled = [...nodes].sort((a, b) => b.score - a.score).slice(0, 14)
   ctx.save()
   ctx.font = '9.5px Inter, sans-serif'
-  ctx.fillStyle = 'rgba(220,220,240,0.72)'
+  ctx.fillStyle = getTheme() === 'light' ? ink(0.72) : 'rgba(220,220,240,0.72)'
   ctx.textAlign = 'center'
   labelled.forEach(n => {
     const t = n.short.length > 14 ? n.short.slice(0, 13) + '…' : n.short

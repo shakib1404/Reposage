@@ -2,12 +2,12 @@ import { useState, useEffect } from 'react'
 import { getHistory } from '../api'
 
 const STATUS_COLOR = {
-  completed:  { bg: 'rgba(52,211,153,0.12)',  border: 'rgba(52,211,153,0.4)',  text: '#34d399' },
-  failed:     { bg: 'rgba(239,68,68,0.12)',   border: 'rgba(239,68,68,0.4)',   text: '#f87171' },
-  executing:  { bg: 'rgba(251,191,36,0.12)',  border: 'rgba(251,191,36,0.4)',  text: '#fbbf24' },
-  analyzing:  { bg: 'rgba(96,165,250,0.12)',  border: 'rgba(96,165,250,0.4)',  text: '#60a5fa' },
-  searching:  { bg: 'rgba(167,139,250,0.12)', border: 'rgba(167,139,250,0.4)', text: '#a78bfa' },
-  auditing:   { bg: 'rgba(251,146,60,0.12)',  border: 'rgba(251,146,60,0.4)',  text: '#fb923c' },
+  completed:  { bg: 'var(--green-dim)',  border: 'color-mix(in srgb, var(--green) 40%, transparent)',  text: 'var(--green)' },
+  failed:     { bg: 'color-mix(in srgb, var(--danger, #ef4444) 12%, transparent)',   border: 'color-mix(in srgb, var(--danger, #ef4444) 40%, transparent)',   text: 'var(--red)' },
+  executing:  { bg: 'var(--yellow-dim)',  border: 'color-mix(in srgb, var(--yellow) 40%, transparent)',  text: 'var(--yellow)' },
+  analyzing:  { bg: 'var(--blue-dim)',  border: 'color-mix(in srgb, var(--blue) 40%, transparent)',  text: 'var(--blue)' },
+  searching:  { bg: 'var(--purple-dim)', border: 'color-mix(in srgb, var(--purple) 40%, transparent)', text: 'var(--purple)' },
+  auditing:   { bg: 'var(--orange-dim)',  border: 'color-mix(in srgb, var(--orange) 40%, transparent)',  text: 'var(--orange)' },
 }
 
 function fmtDate(iso) {

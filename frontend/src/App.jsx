@@ -10,6 +10,7 @@ import TaskExecPage      from './pages/TaskExecPage'
 import CopyDetectPage   from './pages/CopyDetectPage'
 import LandingPage       from './pages/LandingPage'
 import HistoryPage       from './pages/HistoryPage'
+import ThemeToggle       from './components/ThemeToggle'
 import {
   getToken, setToken, clearToken, authMe,
   createHistory, updateHistory,
@@ -310,7 +311,7 @@ export default function App() {
           <div style={{
             width: 30, height: 30, borderRadius: 9, background: 'var(--grad)',
             display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-            boxShadow: '0 4px 14px -5px rgba(93,142,255,0.75)',
+            boxShadow: '0 4px 14px -5px color-mix(in srgb, var(--accent) 75%, transparent)',
           }}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
@@ -336,6 +337,8 @@ export default function App() {
               {task}
             </span>
           )}
+
+          <ThemeToggle />
 
           <button
             onClick={handleNewTask}

@@ -2,45 +2,101 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import mermaid from 'mermaid'
 import { streamArchitect, getArchitectKinds } from '../api'
 import MiniMarkdown from '../components/MiniMarkdown'
+import { getTheme, useTheme } from '../lib/theme'
 
 // ── Mermaid initialisation ────────────────────────────────────────────────────
-mermaid.initialize({
-  startOnLoad:  false,
-  theme:        'dark',
-  darkMode:     true,
-  flowchart:    { curve: 'basis', useMaxWidth: true },
-  // Sequence diagrams are a different renderer with its own defaults; without
-  // this they come out cramped and ignore the dark theme's spacing.
-  sequence: {
-    useMaxWidth:    true,
-    showSequenceNumbers: true,
-    actorMargin:    40,
-    boxMargin:      10,
-    mirrorActors:   false,
-    wrap:           true,
-  },
-  themeVariables: {
-    background:        '#0d1117',
-    mainBkg:           '#161b22',
-    nodeBorder:        '#30363d',
-    clusterBkg:        '#161b22',
-    titleColor:        '#e6edf3',
-    edgeLabelBackground: '#161b22',
-    lineColor:         '#8b949e',
-    actorBkg:          '#1e3a5f',
-    actorBorder:       '#3b82f6',
-    actorTextColor:    '#bfdbfe',
-    actorLineColor:    '#8b949e',
-    signalColor:       '#e6edf3',
-    signalTextColor:   '#e6edf3',
-    labelBoxBkgColor:  '#161b22',
-    labelTextColor:    '#e6edf3',
-    noteBkgColor:      '#451a03',
-    noteTextColor:     '#fde68a',
-    noteBorderColor:   '#f59e0b',
-    sequenceNumberColor: '#0d1117',
-  },
-})
+// Sequence diagrams are a different renderer with its own defaults; without
+// this they come out cramped and ignore the theme's spacing.
+const SEQUENCE_CFG = {
+  useMaxWidth:    true,
+  showSequenceNumbers: true,
+  actorMargin:    40,
+  boxMargin:      10,
+  mirrorActors:   false,
+  wrap:           true,
+}
+
+const DARK_VARS = {
+  background:        '#0d1117',
+  mainBkg:           '#161b22',
+  nodeBorder:        '#30363d',
+  clusterBkg:        '#161b22',
+  titleColor:        '#e6edf3',
+  edgeLabelBackground: '#161b22',
+  lineColor:         '#8b949e',
+  actorBkg:          '#1e3a5f',
+  actorBorder:       '#3b82f6',
+  actorTextColor:    '#bfdbfe',
+  actorLineColor:    '#8b949e',
+  signalColor:       '#e6edf3',
+  signalTextColor:   '#e6edf3',
+  labelBoxBkgColor:  '#161b22',
+  labelTextColor:    '#e6edf3',
+  noteBkgColor:      '#451a03',
+  noteTextColor:     '#fde68a',
+  noteBorderColor:   '#f59e0b',
+  sequenceNumberColor: '#0d1117',
+}
+
+const LIGHT_VARS = {
+  background:          '#fbfcfe',
+  primaryColor:        '#f3f5fb',
+  primaryTextColor:    '#1b1f2e',
+  primaryBorderColor:  '#c3cadb',
+  mainBkg:             '#f3f5fb',
+  nodeBorder:          '#c3cadb',
+  clusterBkg:          '#f7f8fc',
+  clusterBorder:       '#d5dae6',
+  titleColor:          '#1b1f2e',
+  textColor:           '#1b1f2e',
+  edgeLabelBackground: '#ffffff',
+  lineColor:           '#6b7389',
+  actorBkg:            '#e8eefc',
+  actorBorder:         '#4767e6',
+  actorTextColor:      '#1b2b5c',
+  actorLineColor:      '#9aa2b6',
+  signalColor:         '#3a4057',
+  signalTextColor:     '#1b1f2e',
+  labelBoxBkgColor:    '#f3f5fb',
+  labelBoxBorderColor: '#c3cadb',
+  labelTextColor:      '#1b1f2e',
+  noteBkgColor:        '#fff6e0',
+  noteTextColor:       '#6b4500',
+  noteBorderColor:     '#e0a640',
+  sequenceNumberColor: '#ffffff',
+  fontFamily:          'Inter, system-ui, sans-serif',
+}
+
+function initMermaid(theme) {
+  const light = theme === 'light'
+  mermaid.initialize({
+    startOnLoad:  false,
+    theme:        light ? 'base' : 'dark',
+    darkMode:     !light,
+    flowchart:    { curve: 'basis', useMaxWidth: true },
+    sequence:     SEQUENCE_CFG,
+    themeVariables: light ? LIGHT_VARS : DARK_VARS,
+  })
+}
+initMermaid(getTheme())
+
+// The backend compiles its node colours into the diagram source as classDefs
+// tuned for a dark canvas. In light mode they are swapped for pale fills with
+// the same hue, so the grouping still reads; the dark source is left as-is.
+const LIGHT_TONES = {
+  toneNeutral: 'fill:#f4f6fa,stroke:#a9b1c4,stroke-width:1.5px,color:#1b1f2e',
+  toneBlue:    'fill:#e8f0fe,stroke:#3b82f6,stroke-width:1.5px,color:#1e3a8a',
+  toneAmber:   'fill:#fff4e0,stroke:#d97706,stroke-width:1.5px,color:#7c3d00',
+  toneMint:    'fill:#e7f7ee,stroke:#16a34a,stroke-width:1.5px,color:#14532d',
+  toneRose:    'fill:#fde8ec,stroke:#e11d48,stroke-width:1.5px,color:#881337',
+  toneIndigo:  'fill:#eef0ff,stroke:#6366f1,stroke-width:1.5px,color:#312e81',
+  toneTeal:    'fill:#e2f7f4,stroke:#0d9488,stroke-width:1.5px,color:#134e4a',
+}
+function themedSource(code, theme) {
+  if (theme !== 'light') return code
+  return code.replace(/^(\s*classDef\s+)(\w+)\s+[^\n]*$/gm,
+    (line, head, name) => LIGHT_TONES[name] ? `${head}${name} ${LIGHT_TONES[name]}` : line)
+}
 
 // ── Diagram kinds ─────────────────────────────────────────────────────────────
 // Mirrors DIAGRAM_KINDS in backend/architect.py. The backend is still the
@@ -133,12 +189,14 @@ function MermaidDiagram({ code }) {
   const containerRef = useRef(null)
   const [error,  setError]  = useState('')
   const [copied, setCopied] = useState(false)
+  const theme = useTheme()
 
   useEffect(() => {
     if (!code || !containerRef.current) return
     setError('')
+    initMermaid(theme)
     const id = `mermaid-${Date.now()}`
-    mermaid.render(id, code)
+    mermaid.render(id, themedSource(code, theme))
       .then(({ svg }) => {
         if (containerRef.current) {
           containerRef.current.innerHTML = svg
@@ -153,7 +211,7 @@ function MermaidDiagram({ code }) {
       .catch(err => {
         setError(err?.message || 'Mermaid render failed')
       })
-  }, [code])
+  }, [code, theme])
 
   const handleCopy = () => {
     navigator.clipboard.writeText(code).then(() => {
@@ -166,7 +224,7 @@ function MermaidDiagram({ code }) {
     return (
       <div>
         <div style={{
-          padding: '10px 14px', background: '#2d1b1b',
+          padding: '10px 14px', background: 'var(--err-bg, #2d1b1b)',
           border: '1px solid var(--red)', borderRadius: 'var(--radius)',
           color: 'var(--red)', fontSize: 12, marginBottom: 10,
         }}>
@@ -225,7 +283,7 @@ function MermaidDiagram({ code }) {
       <div
         ref={containerRef}
         style={{
-          background: '#0d1117',
+          background: 'var(--graph-bg)',
           border: '1px solid var(--border)',
           borderRadius: 'var(--radius-lg)',
           padding: '20px',
@@ -319,10 +377,11 @@ function GraphStats({ graph, kind }) {
 // A DFD's meaning lives in its shapes, and Mermaid draws no key. Rendered in
 // HTML rather than inside the diagram so it cannot break the Mermaid parse.
 function DataflowLegend() {
+  const light = useTheme() === 'light'
   const items = [
-    { shape: 'rect', tone: '#f59e0b', bg: '#451a03', label: 'External', hint: 'source or sink outside the system' },
-    { shape: 'pill', tone: '#3b82f6', bg: '#1e3a5f', label: 'Process',  hint: 'code that transforms data' },
-    { shape: 'cyl',  tone: '#22c55e', bg: '#052e16', label: 'Store',    hint: 'where data comes to rest' },
+    { shape: 'rect', tone: light ? '#d97706' : '#f59e0b', bg: light ? '#fff4e0' : '#451a03', label: 'External', hint: 'source or sink outside the system' },
+    { shape: 'pill', tone: '#3b82f6', bg: light ? '#e8f0fe' : '#1e3a5f', label: 'Process',  hint: 'code that transforms data' },
+    { shape: 'cyl',  tone: light ? '#16a34a' : '#22c55e', bg: light ? '#e7f7ee' : '#052e16', label: 'Store',    hint: 'where data comes to rest' },
   ]
   return (
     <div style={{
@@ -516,7 +575,7 @@ export default function ArchitectPage({
               {ready && (
                 <span title="Already generated" style={{
                   fontSize: 9, color: active ? 'white' : 'var(--green)',
-                  border: `1px solid ${active ? 'rgba(255,255,255,0.5)' : 'var(--green)'}`,
+                  border: `1px solid ${active ? 'rgba(var(--ink),0.5)' : 'var(--green)'}`,
                   borderRadius: 3, padding: '0 3px', fontWeight: 700,
                 }}>✓</span>
               )}
@@ -541,7 +600,7 @@ export default function ArchitectPage({
           </div>
           {error && (
             <div style={{
-              background: '#2d1b1b', border: '1px solid var(--red)',
+              background: 'var(--err-bg, #2d1b1b)', border: '1px solid var(--red)',
               borderRadius: 'var(--radius)', padding: '10px 16px',
               color: 'var(--red)', fontSize: 12,
               marginBottom: 20, maxWidth: 480, margin: '0 auto 20px',
@@ -641,7 +700,7 @@ export default function ArchitectPage({
               display: 'flex', alignItems: 'center', gap: 6,
             }}>
               <span style={{
-                background: 'var(--accent-dim)', border: '1px solid rgba(93,142,255,0.3)',
+                background: 'var(--accent-dim)', border: '1px solid color-mix(in srgb, var(--accent) 30%, transparent)',
                 borderRadius: 3, padding: '1px 7px', color: 'var(--accent)',
               }}>
                 {kind === 'sequence' ? 'Mermaid Sequence' : 'Mermaid Flowchart'}

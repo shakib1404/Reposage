@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { listOutputs, getOutputUrl } from '../api'
 import ScoreBar from '../components/ScoreBar'
 import {
@@ -195,7 +196,7 @@ export default function OutputPage({ task, selectedRepo, analysis, execResult, u
 
   // ── Hero card ──────────────────────────────────────────────────────────────
   const heroColor  = success ? 'var(--green)'    : 'var(--red)'
-  const heroBg     = success ? 'var(--green-dim)' : 'rgba(239,68,68,0.08)'
+  const heroBg     = success ? 'var(--green-dim)' : 'color-mix(in srgb, var(--danger, #ef4444) 8%, transparent)'
   const heroBorder = success ? 'var(--green)'    : 'var(--red)'
   const heroIcon   = success ? '✅' : '❌'
   const heroTitle  = success ? 'Task completed'  : 'Execution failed'
@@ -297,7 +298,7 @@ export default function OutputPage({ task, selectedRepo, analysis, execResult, u
       {/* ── Manual guide  (only when failed) ────────────────────────────── */}
       {!success && manualGuide && (
         <div style={{
-          background: 'rgba(239,68,68,0.06)',
+          background: 'color-mix(in srgb, var(--danger, #ef4444) 6%, transparent)',
           border: '1px solid var(--red)',
           borderRadius: 'var(--radius-lg)',
           padding: '16px 20px', marginBottom: 12,
@@ -395,8 +396,10 @@ export default function OutputPage({ task, selectedRepo, analysis, execResult, u
         </div>
       )}
 
-      {/* Lightbox */}
-      {activeImg && (
+      {/* Lightbox — portalled to <body>: the page root's fade-in animates
+          `transform`, which makes it the containing block for position:fixed
+          children, so an in-place backdrop only covered the 960px column. */}
+      {activeImg && createPortal(
         <div
           onClick={() => setActiveImg(null)}
           style={{
@@ -408,7 +411,8 @@ export default function OutputPage({ task, selectedRepo, analysis, execResult, u
         >
           <img src={activeImg} alt="preview"
             style={{ maxWidth: '90vw', maxHeight: '90vh', borderRadius: 8 }} />
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* ── Output files ─────────────────────────────────────────────────── */}

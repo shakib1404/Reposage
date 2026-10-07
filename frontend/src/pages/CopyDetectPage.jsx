@@ -4,9 +4,9 @@ import { streamCopyDetect, getCorpusStatus, streamCorpusAdd, streamCorpusSearch 
 // ── Similarity colour helpers ─────────────────────────────────────────────────
 
 function simColor(sim) {
-  if (sim >= 0.8) return '#f87171'  // high  → red
-  if (sim >= 0.5) return '#fbbf24'  // mid   → yellow
-  return '#34d399'                   // low   → green
+  if (sim >= 0.8) return 'var(--red)'  // high  → red
+  if (sim >= 0.5) return 'var(--yellow)'  // mid   → yellow
+  return 'var(--green)'                   // low   → green
 }
 
 function SimBar({ value }) {
@@ -123,7 +123,7 @@ function DetectionCard({ det, index }) {
         <div style={{
           fontSize: 12, fontWeight: 700,
           color: simColor(det.similarity),
-          background: `${simColor(det.similarity)}22`,
+          background: `color-mix(in srgb, ${simColor(det.similarity)} 13%, transparent)`,
           border: `1px solid ${simColor(det.similarity)}`,
           borderRadius: 20, padding: '2px 10px', flexShrink: 0,
         }}>
@@ -234,7 +234,7 @@ function DuplicateCard({ dup, index }) {
         <div style={{
           fontSize: 12, fontWeight: 700,
           color: simColor(dup.similarity),
-          background: `${simColor(dup.similarity)}22`,
+          background: `color-mix(in srgb, ${simColor(dup.similarity)} 13%, transparent)`,
           border: `1px solid ${simColor(dup.similarity)}`,
           borderRadius: 20, padding: '2px 10px', flexShrink: 0,
         }}>
@@ -299,7 +299,7 @@ function CorpusMatchCard({ m, index }) {
         <div style={{
           fontSize: 12, fontWeight: 700,
           color: simColor(m.similarity),
-          background: `${simColor(m.similarity)}22`,
+          background: `color-mix(in srgb, ${simColor(m.similarity)} 13%, transparent)`,
           border: `1px solid ${simColor(m.similarity)}`,
           borderRadius: 20, padding: '2px 10px', flexShrink: 0,
         }}>
@@ -922,16 +922,18 @@ export default function CopyDetectPage() {
                 {results.length}
               </div>
               <div style={{ fontSize: 13, color: 'var(--txt2)' }}>
-                {mode === 'self_scan' ? 'duplicate' : 'match'}{results.length !== 1 ? 'es' : ''} found
+                {mode === 'self_scan'
+                  ? (results.length !== 1 ? 'duplicates' : 'duplicate')
+                  : (results.length !== 1 ? 'matches' : 'match')} found
                 {isRunning && <span className="pulse" style={{ color: 'var(--accent)', marginLeft: 8 }}>● scanning…</span>}
                 {isDone && <span style={{ color: 'var(--green)', marginLeft: 8 }}>✓ complete</span>}
               </div>
 
               {results.length > 0 && (
                 <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, fontSize: 11, color: 'var(--txt3)' }}>
-                  <span style={{ color: '#f87171' }}>■ high ≥80%</span>
-                  <span style={{ color: '#fbbf24' }}>■ mid ≥50%</span>
-                  <span style={{ color: '#34d399' }}>■ low &lt;50%</span>
+                  <span style={{ color: 'var(--red)' }}>■ high ≥80%</span>
+                  <span style={{ color: 'var(--yellow)' }}>■ mid ≥50%</span>
+                  <span style={{ color: 'var(--green)' }}>■ low &lt;50%</span>
                 </div>
               )}
             </div>

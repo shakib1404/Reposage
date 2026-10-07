@@ -5,6 +5,11 @@
  * Fullscreen (fullscreen=true):  list of ALL nodes on left, click → ego graph on right
  */
 import { useEffect, useRef, useCallback, useState, useMemo } from 'react'
+import { getTheme, useTheme, ink } from '../lib/theme'
+
+// Canvas can't read CSS variables directly, so ink colours are resolved per
+// draw. Dark values are the original literals; light uses the theme's ink.
+const isLight = () => getTheme() === 'light'
 
 // ── Palettes ──────────────────────────────────────────────────────────────────
 const PALETTES = {
@@ -73,7 +78,7 @@ function drawGraph(ctx, W, H, edges, names, positions, palette, hoveredNode, tra
     const hl = hoveredNode && (e.from===hoveredNode||e.to===hoveredNode)
     ctx.save()
     ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y)
-    ctx.strokeStyle = hl ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.1)'
+    ctx.strokeStyle = hl ? ink(0.55) : ink(isLight() ? 0.16 : 0.1)
     ctx.lineWidth = hl ? w*1.8 : w; ctx.stroke()
     const ang = Math.atan2(b.y-a.y,b.x-a.x), nr=10
     const bx=b.x-nr*Math.cos(ang), by=b.y-nr*Math.sin(ang)
@@ -81,7 +86,7 @@ function drawGraph(ctx, W, H, edges, names, positions, palette, hoveredNode, tra
     ctx.moveTo(bx-6*Math.cos(ang-0.45),by-6*Math.sin(ang-0.45))
     ctx.lineTo(bx,by)
     ctx.lineTo(bx-6*Math.cos(ang+0.45),by-6*Math.sin(ang+0.45))
-    ctx.strokeStyle = hl ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.2)'
+    ctx.strokeStyle = hl ? ink(0.6) : ink(isLight() ? 0.3 : 0.2)
     ctx.lineWidth = hl?1.5:1; ctx.stroke(); ctx.restore()
   })
   names.forEach((n,i) => {
@@ -93,7 +98,7 @@ function drawGraph(ctx, W, H, edges, names, positions, palette, hoveredNode, tra
     ctx.fillStyle=clr+(hl?'ff':'cc'); ctx.shadowColor=clr; ctx.shadowBlur=hl?12:4; ctx.fill(); ctx.restore()
     ctx.save()
     ctx.font=`${Math.max(9,Math.min(12,10+(scale-1)*3))}px 'JetBrains Mono',monospace`
-    ctx.fillStyle = hl?'rgba(255,255,255,1)':'rgba(210,210,235,0.8)'; ctx.textAlign='center'
+    ctx.fillStyle = hl ? ink(1) : (isLight() ? ink(0.72) : 'rgba(210,210,235,0.8)'); ctx.textAlign='center'
     const maxLen=W>400?18:11, label=n.length>maxLen?n.slice(0,maxLen-1)+'…':n
     ctx.fillText(label,p.x,p.y+r+13); ctx.restore()
   })
@@ -109,6 +114,7 @@ function EgoCanvas({ selected, egoEdges, egoNodes, nodeModule, moduleColor, onNo
   const dragRef      = useRef(null)
   const hoveredRef   = useRef(null)
   const wasDrag      = useRef(false)
+  const theme        = useTheme()
 
   // Radial layout: selected at center, neighbors around it
   const layout = useMemo(() => {
@@ -143,6 +149,7 @@ function EgoCanvas({ selected, egoEdges, egoNodes, nodeModule, moduleColor, onNo
     const W    = canvas.width/dpr, H = canvas.height/dpr
     const { scale, tx, ty } = transformRef.current
 
+    ctx.setTransform(dpr,0,0,dpr,0,0)
     ctx.clearRect(0,0,W,H)
     ctx.save(); ctx.translate(tx,ty); ctx.scale(scale,scale)
 
@@ -155,7 +162,7 @@ function EgoCanvas({ selected, egoEdges, egoNodes, nodeModule, moduleColor, onNo
       const isOut  = e.from === selected
       const isIn   = e.to   === selected
       const hl     = hoveredRef.current && (e.from===hoveredRef.current||e.to===hoveredRef.current)
-      const color  = isOut ? '#34d399' : isIn ? '#60a5fa' : 'rgba(200,200,220,0.25)'
+      const color  = isOut ? (isLight() ? '#10a37a' : '#34d399') : isIn ? (isLight() ? '#3b82f6' : '#60a5fa') : (isLight() ? ink(0.25) : 'rgba(200,200,220,0.25)')
       const w      = Math.min(0.9+(e.weight||1)*0.35, 3)
 
       ctx.save()
@@ -200,7 +207,7 @@ function EgoCanvas({ selected, egoEdges, egoNodes, nodeModule, moduleColor, onNo
 
       ctx.save(); ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2)
       if (isSel) {
-        ctx.fillStyle='#0f172a'; ctx.strokeStyle=color
+        ctx.fillStyle=isLight() ? '#ffffff' : '#0f172a'; ctx.strokeStyle=color
         ctx.lineWidth=3; ctx.shadowColor=color; ctx.shadowBlur=22
         ctx.fill(); ctx.stroke()
       } else {
@@ -214,7 +221,7 @@ function EgoCanvas({ selected, egoEdges, egoNodes, nodeModule, moduleColor, onNo
       ctx.font = isSel
         ? `bold 12px 'JetBrains Mono',monospace`
         : `10px 'JetBrains Mono',monospace`
-      ctx.fillStyle = isSel ? color : (hl?'#fff':'rgba(210,215,240,0.85)')
+      ctx.fillStyle = isSel ? color : (hl ? ink(1) : (isLight() ? ink(0.75) : 'rgba(210,215,240,0.85)'))
       ctx.textAlign = 'center'
       if (isSel) {
         ctx.textBaseline='middle'; ctx.fillText(n,p.x,p.y)
@@ -230,7 +237,9 @@ function EgoCanvas({ selected, egoEdges, egoNodes, nodeModule, moduleColor, onNo
         const goesOut = egoEdges.some(e=>e.from===selected&&e.to===n)
         const comesIn = egoEdges.some(e=>e.to===selected&&e.from===n)
         const badge   = goesOut&&comesIn ? '↔' : goesOut ? '→' : '←'
-        const bclr    = goesOut&&comesIn ? '#fbbf24' : goesOut ? '#34d399' : '#60a5fa'
+        const bclr    = isLight()
+          ? (goesOut&&comesIn ? '#b7791f' : goesOut ? '#10a37a' : '#3b82f6')
+          : (goesOut&&comesIn ? '#fbbf24' : goesOut ? '#34d399' : '#60a5fa')
         ctx.save()
         ctx.font='9px sans-serif'; ctx.fillStyle=bclr
         ctx.textAlign='left'; ctx.textBaseline='top'
@@ -240,7 +249,7 @@ function EgoCanvas({ selected, egoEdges, egoNodes, nodeModule, moduleColor, onNo
     })
 
     ctx.restore()
-  }, [selected, egoEdges, egoNodes, layout, nodeModule, moduleColor])
+  }, [selected, egoEdges, egoNodes, layout, nodeModule, moduleColor, theme]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Initial setup whenever layout changes
   useEffect(() => {
@@ -490,13 +499,13 @@ function FullscreenNodeGraph({ edges, nodes, colorScheme }) {
       </div>
 
       {/* ── Right: ego graph ─────────────────────────────────────────────── */}
-      <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', background:'#0d1117' }}>
+      <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', background:'var(--graph-bg)' }}>
 
         {/* Header bar */}
         <div style={{
           padding:'8px 14px', borderBottom:'1px solid var(--border)',
           display:'flex', alignItems:'center', gap:10,
-          background:'rgba(13,17,23,0.95)', flexShrink:0,
+          background:'var(--graph-bar)', flexShrink:0,
         }}>
           {selected ? (
             <>
@@ -507,8 +516,8 @@ function FullscreenNodeGraph({ edges, nodes, colorScheme }) {
                 <span style={{ fontSize:11, color:'var(--txt3)' }}>in {nodeModule[selected]}</span>
               )}
               <div style={{ marginLeft:'auto', display:'flex', gap:14, fontSize:11, color:'var(--txt3)' }}>
-                <span style={{ color:'#34d399' }}>→ {outCount} out</span>
-                <span style={{ color:'#60a5fa' }}>← {inCount} in</span>
+                <span style={{ color:'var(--green)' }}>→ {outCount} out</span>
+                <span style={{ color:'var(--blue)' }}>← {inCount} in</span>
                 <span style={{ opacity:0.5 }}>scroll=zoom · drag=pan · dbl-click=fit · click node=navigate</span>
               </div>
             </>
@@ -540,12 +549,12 @@ function FullscreenNodeGraph({ edges, nodes, colorScheme }) {
             <div style={{
               position:'absolute', bottom:14, right:14,
               display:'flex', gap:14, fontSize:11,
-              background:'rgba(13,17,23,0.8)', padding:'5px 12px', borderRadius:6,
+              background:'var(--graph-bar)', padding:'5px 12px', borderRadius:6,
               border:'1px solid var(--border)',
             }}>
-              <span style={{ color:'#34d399' }}>→ outgoing</span>
-              <span style={{ color:'#60a5fa' }}>← incoming</span>
-              <span style={{ color:'#fbbf24' }}>↔ both</span>
+              <span style={{ color:'var(--green)' }}>→ outgoing</span>
+              <span style={{ color:'var(--blue)' }}>← incoming</span>
+              <span style={{ color:'var(--yellow)' }}>↔ both</span>
             </div>
           )}
         </div>
@@ -559,6 +568,7 @@ function FullscreenNodeGraph({ edges, nodes, colorScheme }) {
 // ═══════════════════════════════════════════════════════════════════════════════
 export function GraphCanvasCompact({ edges=[], nodes=[], height=220, colorScheme='green' }) {
   const canvasRef=useRef()
+  const theme=useTheme()
   useEffect(()=>{
     const canvas=canvasRef.current; if(!canvas) return
     const dpr=window.devicePixelRatio||1
@@ -575,7 +585,7 @@ export function GraphCanvasCompact({ edges=[], nodes=[], height=220, colorScheme
       positions[n]={x:W/2+Math.cos(angle)*r, y:H/2+Math.sin(angle)*r}
     })
     drawGraph(ctx,W,H,edges,names,positions,palette,null,{})
-  },[edges,nodes,colorScheme])
+  },[edges,nodes,colorScheme,theme])
   return <canvas ref={canvasRef} style={{width:'100%',height,display:'block',borderRadius:6}}/>
 }
 
@@ -589,6 +599,7 @@ function CompactCanvas({ edges, nodes, height, colorScheme }) {
   const transformRef = useRef({ scale:1, tx:0, ty:0 })
   const hoveredRef   = useRef(null)
   const palette      = PALETTES[colorScheme||'green']
+  const theme        = useTheme()
 
   const redraw = useCallback(() => {
     const canvas = canvasRef.current; if (!canvas||!layoutRef.current) return
@@ -598,7 +609,7 @@ function CompactCanvas({ edges, nodes, height, colorScheme }) {
     drawGraph(ctx, canvas.width/dpr, canvas.height/dpr,
       edges, namesRef.current, layoutRef.current, palette, hoveredRef.current, transformRef.current)
     ctx.restore()
-  }, [edges, palette])
+  }, [edges, palette, theme]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const canvas = canvasRef.current; if (!canvas) return

@@ -113,7 +113,7 @@ export default function TreeView({ modules = [], classes = [], height = 220, ful
                   >
                     <ChevronIcon open={clsOpen} small />
                     <ClassIcon />
-                    <span style={{ color: '#a78bfa', flex: 1 }}>
+                    <span style={{ color: 'var(--purple)', flex: 1 }}>
                       {cls.name}
                       {bases && <span style={{ color: 'var(--txt3)', fontSize: 10 }}> ({bases})</span>}
                     </span>
@@ -210,9 +210,9 @@ function ChevronIcon({ open, small = false }) {
 
 function ScorePill({ score }) {
   const v   = parseFloat(score)
-  const clr = v >= 8.5 ? '#34d399' : v >= 7 ? '#fbbf24' : 'var(--txt3)'
+  const clr = v >= 8.5 ? 'var(--green)' : v >= 7 ? 'var(--yellow)' : 'var(--txt3)'
   return (
-    <span style={{ fontSize: 10, color: clr, border: `1px solid ${clr}44`, borderRadius: 10, padding: '0 5px', flexShrink: 0 }}>
+    <span style={{ fontSize: 10, color: clr, border: `1px solid color-mix(in srgb, ${clr} 27%, transparent)`, borderRadius: 10, padding: '0 5px', flexShrink: 0 }}>
       {score}
     </span>
   )
@@ -226,7 +226,7 @@ const FileIcon  = () => (
 )
 
 const ClassIcon = () => (
-  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--purple)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
     <rect x="2" y="3" width="20" height="14" rx="2"/>
     <line x1="8" y1="21" x2="16" y2="21"/>
     <line x1="12" y1="17" x2="12" y2="21"/>

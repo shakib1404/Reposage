@@ -129,7 +129,7 @@ export default function SearchPage({ task, setTask, setRepos, setSuggestions, se
             fontFamily: 'var(--font)', fontSize: 14.5, outline: 'none',
             transition: 'border-color 0.15s, box-shadow 0.15s',
           }}
-          onFocus={e => { e.target.style.borderColor = 'var(--accent)'; e.target.style.boxShadow = '0 0 0 3px rgba(93,142,255,0.14)' }}
+          onFocus={e => { e.target.style.borderColor = 'var(--accent)'; e.target.style.boxShadow = '0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent)' }}
           onBlur={e  => { e.target.style.borderColor = 'var(--border2)'; e.target.style.boxShadow = 'none' }}
         />
         <Btn onClick={doSearch} disabled={loading} primary>
@@ -255,7 +255,7 @@ function Btn({ children, onClick, disabled, primary }) {
     <button onClick={onClick} disabled={disabled} style={{
       padding: '12px 20px', border: `1px solid ${primary ? 'transparent' : 'var(--border2)'}`,
       borderRadius: 'var(--radius)', background: primary ? 'var(--grad)' : 'transparent',
-      boxShadow: primary && !disabled ? '0 6px 20px -8px rgba(93,142,255,0.7)' : 'none',
+      boxShadow: primary && !disabled ? '0 6px 20px -8px color-mix(in srgb, var(--accent) 70%, transparent)' : 'none',
       color: primary ? 'white' : 'var(--txt)', fontFamily: 'var(--font)', fontSize: 13,
       fontWeight: 500, cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.6 : 1,
       display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap',

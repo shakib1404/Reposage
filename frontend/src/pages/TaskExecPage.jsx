@@ -179,7 +179,7 @@ export default function TaskExecPage({ task: defaultTask, selectedRepo, jobId, i
           {rc !== null && (
             <div style={{
               marginTop: 8, padding: '8px 10px', borderRadius: 'var(--radius)',
-              background: success ? 'var(--green-dim)' : 'rgba(248,113,113,0.1)',
+              background: success ? 'var(--green-dim)' : 'color-mix(in srgb, var(--red) 10%, transparent)',
               border: `1px solid ${success ? 'var(--green)' : 'var(--red)'}`,
               fontSize: 12, fontWeight: 600,
               color: success ? 'var(--green)' : 'var(--red)',
@@ -206,9 +206,9 @@ export default function TaskExecPage({ task: defaultTask, selectedRepo, jobId, i
           display: 'flex', alignItems: 'center', gap: 8,
         }}>
           <div style={{ display: 'flex', gap: 5 }}>
-            <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#f87171' }} />
-            <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#fbbf24' }} />
-            <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#34d399' }} />
+            <div style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--red)' }} />
+            <div style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--yellow)' }} />
+            <div style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--green)' }} />
           </div>
           <span style={{ fontSize: 11, color: 'var(--txt3)', fontFamily: 'var(--mono)' }}>
             repository_agent — {resolvedRepo || 'no repo'}

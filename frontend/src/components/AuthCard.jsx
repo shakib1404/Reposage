@@ -83,7 +83,7 @@ export default function AuthCard({ onAuth, mode, setMode, resetToken = '' }) {
     <div
       id="auth"
       style={{
-        background: 'linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015))',
+        background: 'var(--auth-card, linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015)))',
         border: '1px solid var(--border2)',
         borderRadius: 'var(--radius-lg)',
         padding: '26px 24px',
@@ -96,7 +96,7 @@ export default function AuthCard({ onAuth, mode, setMode, resetToken = '' }) {
       {/* ── Mode switch ─────────────────────────────────────────────────── */}
       {(mode === 'login' || mode === 'register') && (
         <div style={{
-          display: 'flex', background: 'rgba(0,0,0,0.3)',
+          display: 'flex', background: 'var(--sunk)',
           border: '1px solid var(--border)',
           borderRadius: 9, padding: 3, marginBottom: 22,
         }}>
@@ -213,7 +213,7 @@ function Banner({ kind, children }) {
       role={ok ? 'status' : 'alert'}
       style={{
         background: ok ? 'var(--green-dim)' : 'var(--red-dim)',
-        border: `1px solid ${ok ? 'rgba(52,211,153,0.4)' : 'rgba(248,113,113,0.4)'}`,
+        border: `1px solid ${ok ? 'color-mix(in srgb, var(--green) 40%, transparent)' : 'color-mix(in srgb, var(--red) 40%, transparent)'}`,
         borderRadius: 7, padding: '9px 12px',
         fontSize: 12.5, lineHeight: 1.5,
         color: ok ? 'var(--green)' : 'var(--red)',
@@ -238,8 +238,8 @@ function Field({ label, type, value, onChange, placeholder, required, autoComple
       <div style={{
         display: 'flex', alignItems: 'center',
         border: `1px solid ${focus ? 'var(--accent)' : 'var(--border2)'}`,
-        borderRadius: 8, background: 'rgba(0,0,0,0.28)',
-        boxShadow: focus ? '0 0 0 3px rgba(93,142,255,0.14)' : 'none',
+        borderRadius: 8, background: 'var(--input-bg, rgba(0,0,0,0.28))',
+        boxShadow: focus ? '0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent)' : 'none',
         transition: 'border-color 0.15s, box-shadow 0.15s',
         paddingRight: trailing ? 10 : 0,
       }}>

@@ -124,7 +124,7 @@ export default function ExecutePage({ task, selectedRepo, analysis, setExecResul
 
     {/* ── Credential modal ─────────────────────────────────────────────── */}
     {credFields.length > 0 && (
-      <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.75)', zIndex:200, display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ position:'fixed', inset:0, background:'var(--overlay)', zIndex:200, display:'flex', alignItems:'center', justifyContent:'center' }}>
         <div style={{ background:'var(--bg2)', border:'1px solid var(--border2)', borderRadius:'var(--radius-lg)', padding:'24px 28px', width:420, maxWidth:'90vw' }} className="fade-in">
           <div style={{ fontSize:16, fontWeight:600, marginBottom:6 }}>🔑 Credentials required</div>
           <div style={{ fontSize:12, color:'var(--txt2)', marginBottom:18, lineHeight:1.6 }}>

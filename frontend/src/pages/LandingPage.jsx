@@ -7,6 +7,7 @@
  */
 import { useState, useEffect, useRef } from 'react'
 import AuthCard from '../components/AuthCard'
+import ThemeToggle from '../components/ThemeToggle'
 
 // ── The eight workflow stages, in the order the app's tabs run them ────────
 const STAGES = [
@@ -161,7 +162,7 @@ function Logo({ size = 30 }) {
       width: size, height: size, borderRadius: size / 3.6,
       background: 'var(--grad)', flexShrink: 0,
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-      boxShadow: '0 4px 14px -4px rgba(93,142,255,0.7)',
+      boxShadow: '0 4px 14px -4px color-mix(in srgb, var(--accent) 70%, transparent)',
     }}>
       <svg width={size * 0.55} height={size * 0.55} viewBox="0 0 24 24" fill="none"
         stroke="white" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
@@ -218,6 +219,7 @@ export default function LandingPage({ onAuth }) {
               <a href="#safety">Safety</a>
             </div>
             <div style={{ flex: 1 }} />
+            <ThemeToggle />
             <button className="lp-btn lp-btn-ghost lp-nav-signin" onClick={() => jumpToAuth('login')}>
               Sign in
             </button>

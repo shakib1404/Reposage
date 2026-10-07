@@ -10,19 +10,19 @@ import CodeSnippet from '../components/CodeSnippet'
 
 // ── Severity config ───────────────────────────────────────────────────────────
 const SEV = {
-  critical: { color: '#f87171', bg: 'rgba(248,113,113,0.12)', label: 'Critical' },
-  high:     { color: '#fb923c', bg: 'rgba(251,146,60,0.12)',  label: 'High'     },
-  medium:   { color: '#fbbf24', bg: 'rgba(251,191,36,0.12)',  label: 'Medium'   },
-  low:      { color: '#34d399', bg: 'rgba(52,211,153,0.12)',  label: 'Low'      },
-  info:     { color: '#8888a0', bg: 'rgba(136,136,160,0.12)', label: 'Info'     },
+  critical: { color: 'var(--red)', bg: 'var(--red-dim)', label: 'Critical' },
+  high:     { color: 'var(--orange)', bg: 'var(--orange-dim)',  label: 'High'     },
+  medium:   { color: 'var(--yellow)', bg: 'var(--yellow-dim)',  label: 'Medium'   },
+  low:      { color: 'var(--green)', bg: 'var(--green-dim)',  label: 'Low'      },
+  info:     { color: 'var(--txt2)', bg: 'color-mix(in srgb, var(--txt2) 12%, transparent)', label: 'Info'     },
 }
 
 const GRADE_STYLE = {
-  A: { color: '#34d399', bg: 'rgba(52,211,153,0.15)',   border: '#34d399' },
-  B: { color: '#5d8eff', bg: 'rgba(93,142,255,0.15)',   border: '#5d8eff' },
-  C: { color: '#fbbf24', bg: 'rgba(251,191,36,0.15)',   border: '#fbbf24' },
-  D: { color: '#fb923c', bg: 'rgba(251,146,60,0.15)',   border: '#fb923c' },
-  F: { color: '#f87171', bg: 'rgba(248,113,113,0.15)',  border: '#f87171' },
+  A: { color: 'var(--green)', bg: 'color-mix(in srgb, var(--green) 15%, transparent)',   border: 'var(--green)' },
+  B: { color: 'var(--accent)', bg: 'color-mix(in srgb, var(--accent) 15%, transparent)',   border: 'var(--accent)' },
+  C: { color: 'var(--yellow)', bg: 'color-mix(in srgb, var(--yellow) 15%, transparent)',   border: 'var(--yellow)' },
+  D: { color: 'var(--orange)', bg: 'color-mix(in srgb, var(--orange) 15%, transparent)',   border: 'var(--orange)' },
+  F: { color: 'var(--red)', bg: 'color-mix(in srgb, var(--red) 15%, transparent)',  border: 'var(--red)' },
 }
 
 // Where in the repo a finding lives, as the backend classifies it.
@@ -294,7 +294,7 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
             </div>
             <div style={{
               maxWidth: 440, fontSize: 12, lineHeight: 1.65, color: 'var(--txt3)',
-              background: 'var(--purple-dim)', border: '1px solid rgba(167,139,250,0.3)',
+              background: 'var(--purple-dim)', border: '1px solid color-mix(in srgb, var(--purple) 30%, transparent)',
               borderRadius: 'var(--radius)', padding: '10px 14px', marginTop: 4,
             }}>
               <strong style={{ color: 'var(--purple)' }}>🏛️ Architecture Health</strong> is RepoSage's
@@ -541,7 +541,7 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
                                 else, so the explanation has to travel with the
                                 finding. */}
                             {RULE_INFO[f.rule] && (
-                              <div style={{ marginTop: 10, padding: '9px 11px', background: 'rgba(93,142,255,0.06)', border: '1px solid rgba(93,142,255,0.25)', borderRadius: 6 }}>
+                              <div style={{ marginTop: 10, padding: '9px 11px', background: 'color-mix(in srgb, var(--accent) 6%, transparent)', border: '1px solid color-mix(in srgb, var(--accent) 25%, transparent)', borderRadius: 6 }}>
                                 <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--accent)', marginBottom: 4 }}>
                                   {RULE_INFO[f.rule][0]}
                                   <span style={{ fontSize: 9, fontWeight: 500, color: 'var(--txt3)', marginLeft: 8, letterSpacing: '0.06em' }}>

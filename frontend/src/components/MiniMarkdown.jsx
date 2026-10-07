@@ -36,7 +36,7 @@ function inline(text, keyPrefix) {
       out.push(
         <code key={k} style={{
           fontFamily: 'var(--mono)', fontSize: '0.92em',
-          background: 'rgba(255,255,255,0.09)', padding: '1px 5px',
+          background: 'rgba(var(--ink),0.09)', padding: '1px 5px',
           borderRadius: 4, wordBreak: 'break-word',
         }}>{tok.slice(n, -n)}</code>
       )
@@ -71,7 +71,7 @@ function renderBlocks(src) {
       nodes.push(
         <pre key={`f${pi}`} style={{
           fontFamily: 'var(--mono)', fontSize: 11,
-          background: 'rgba(0,0,0,0.38)', border: '1px solid var(--border)',
+          background: 'var(--md-pre, rgba(0,0,0,0.38))', border: '1px solid var(--border)',
           borderRadius: 6, padding: '9px 11px', margin: '8px 0',
           overflowX: 'auto', whiteSpace: 'pre', lineHeight: 1.6,
         }}>{body}</pre>

@@ -1,12 +1,12 @@
 import { useEffect, useRef } from 'react'
 
 const TYPE_META = {
-  explore:  { label:'explore',  bg:'rgba(93,142,255,0.12)',  border:'rgba(93,142,255,0.3)',  color:'#5d8eff' },
-  exec:     { label:'exec',     bg:'rgba(52,211,153,0.10)',  border:'rgba(52,211,153,0.3)',  color:'#34d399' },
-  feedback: { label:'feedback', bg:'rgba(251,191,36,0.10)',  border:'rgba(251,191,36,0.3)',  color:'#fbbf24' },
-  error:    { label:'error',    bg:'rgba(248,113,113,0.10)', border:'rgba(248,113,113,0.3)', color:'#f87171' },
-  context:  { label:'context',  bg:'rgba(167,139,250,0.10)', border:'rgba(167,139,250,0.3)', color:'#a78bfa' },
-  done:     { label:'done',     bg:'rgba(52,211,153,0.12)',  border:'rgba(52,211,153,0.4)',  color:'#34d399' },
+  explore:  { label:'explore',  bg:'var(--accent-dim)',  border:'color-mix(in srgb, var(--accent) 30%, transparent)',  color:'var(--accent)' },
+  exec:     { label:'exec',     bg:'color-mix(in srgb, var(--green) 10%, transparent)',  border:'color-mix(in srgb, var(--green) 30%, transparent)',  color:'var(--green)' },
+  feedback: { label:'feedback', bg:'color-mix(in srgb, var(--yellow) 10%, transparent)',  border:'color-mix(in srgb, var(--yellow) 30%, transparent)',  color:'var(--yellow)' },
+  error:    { label:'error',    bg:'color-mix(in srgb, var(--red) 10%, transparent)', border:'color-mix(in srgb, var(--red) 30%, transparent)', color:'var(--red)' },
+  context:  { label:'context',  bg:'color-mix(in srgb, var(--purple) 10%, transparent)', border:'color-mix(in srgb, var(--purple) 30%, transparent)', color:'var(--purple)' },
+  done:     { label:'done',     bg:'var(--green-dim)',  border:'color-mix(in srgb, var(--green) 40%, transparent)',  color:'var(--green)' },
 }
 
 export default function LoopFeed({ events = [] }) {

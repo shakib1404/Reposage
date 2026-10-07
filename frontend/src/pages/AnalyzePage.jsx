@@ -19,19 +19,19 @@ const GRAPH_META = {
   fcg: {
     label: 'FCG',
     title: 'Function Call Graph',
-    color: '#34d399',
+    color: 'var(--green)',
     desc:  'Directed edges from caller to callee. Edge weight = call-site count. Reveals runtime coupling.',
   },
   mdg: {
     label: 'MDG',
     title: 'Module Dependency Graph',
-    color: '#60a5fa',
+    color: 'var(--blue)',
     desc:  'Import-level edges between modules. In-degree ↑ = higher reuse. Used for PageRank scoring.',
   },
   files: {
     label: 'FILES',
     title: 'Repository files',
-    color: '#f59e0b',
+    color: 'var(--amber, #f59e0b)',
     desc:  'Every file in the repo, exactly as github.com lists it — not just the parsed Python modules the HCT shows.',
   },
 }
@@ -60,7 +60,7 @@ function GraphModal({ graphKey, analysis, onClose, repoFullName = '' }) {
   const body = (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 1000,
-      background: 'rgba(6,7,10,0.97)',
+      background: 'var(--panel-solid, rgba(6,7,10,0.97))',
       display: 'flex', flexDirection: 'column',
     }}>
       {/* Modal header */}
@@ -73,7 +73,7 @@ function GraphModal({ graphKey, analysis, onClose, repoFullName = '' }) {
         <span style={{
           fontSize: 11, fontWeight: 600, letterSpacing: '0.08em',
           textTransform: 'uppercase', color: meta.color,
-          border: `1px solid ${meta.color}66`,
+          border: `1px solid color-mix(in srgb, ${meta.color} 40%, transparent)`,
           borderRadius: 4, padding: '2px 7px',
         }}>
           {meta.label}
@@ -137,7 +137,7 @@ function GraphModal({ graphKey, analysis, onClose, repoFullName = '' }) {
                 <div style={{ fontFamily: 'var(--mono)', fontSize: 12, lineHeight: 2, overflowY: 'auto', maxHeight: 'calc(100vh - 160px)' }}>
                   {classes.slice(0, 30).map(c => (
                     <div key={c.name} style={{ marginBottom: 6 }}>
-                      <div style={{ color: '#a78bfa', fontWeight: 500 }}>
+                      <div style={{ color: 'var(--purple)', fontWeight: 500 }}>
                         {c.name}
                         {(c.bases||[]).filter(b => b && b !== 'object').length > 0 && (
                           <span style={{ color: 'var(--txt3)', fontWeight: 400, fontSize: 11 }}>
@@ -225,7 +225,7 @@ function ExpandableCard({ graphKey, children, repoFullName = '' }) {
           <span style={{
             fontSize: 10, fontWeight: 600, letterSpacing: '0.07em',
             textTransform: 'uppercase', color: meta.color,
-            border: `1px solid ${meta.color}55`, borderRadius: 3, padding: '1px 6px',
+            border: `1px solid color-mix(in srgb, ${meta.color} 33%, transparent)`, borderRadius: 3, padding: '1px 6px',
             flexShrink: 0,
           }}>
             {meta.label}
@@ -274,11 +274,11 @@ function RagBadge({ status }) {
     return (
       <span style={{
         fontSize: 10, padding: '2px 7px', borderRadius: 10,
-        background: '#1c2a1c', border: '1px solid #22c55e44',
-        color: '#22c55e', fontWeight: 600,
+        background: 'var(--ok-bg, #1c2a1c)', border: '1px solid var(--ok-line, #22c55e44)',
+        color: 'var(--ok, #22c55e)', fontWeight: 600,
         display: 'flex', alignItems: 'center', gap: 4,
       }}>
-        <span className="pulse" style={{ width: 6, height: 6, borderRadius: '50%', background: '#22c55e', display: 'inline-block' }} />
+        <span className="pulse" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--ok, #22c55e)', display: 'inline-block' }} />
         Building…
       </span>
     )
@@ -287,8 +287,8 @@ function RagBadge({ status }) {
     return (
       <span style={{
         fontSize: 10, padding: '2px 7px', borderRadius: 10,
-        background: '#1c2a1c', border: '1px solid #22c55e66',
-        color: '#22c55e', fontWeight: 600,
+        background: 'var(--ok-bg, #1c2a1c)', border: '1px solid var(--ok-line, #22c55e66)',
+        color: 'var(--ok, #22c55e)', fontWeight: 600,
       }}>
         RAG {status}
       </span>
@@ -361,7 +361,7 @@ function ChatPanel({ repo, analysis, history, setHistory, onClose, ragStatus, bu
       width: 440, zIndex: 1100,
       display: 'flex', flexDirection: 'column',
       background: 'var(--bg)', borderLeft: '1px solid var(--border)',
-      boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
+      boxShadow: 'var(--panel-shadow, -4px 0 24px rgba(0,0,0,0.4))',
       fontFamily: 'var(--font)',
     }}>
       {/* Header */}
@@ -416,23 +416,23 @@ function ChatPanel({ repo, analysis, history, setHistory, onClose, ragStatus, bu
       {isBuilding && (
         <div style={{
           padding: '10px 14px', flexShrink: 0,
-          background: '#0f1a0f', borderBottom: '1px solid #22c55e22',
+          background: 'var(--ok-bg2, #0f1a0f)', borderBottom: '1px solid var(--ok-line, #22c55e22)',
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-            <div style={{ fontSize: 11, color: '#86efac', fontWeight: 500, flex: 1 }}>
+            <div style={{ fontSize: 11, color: 'var(--ok-soft, #86efac)', fontWeight: 500, flex: 1 }}>
               Building knowledge base…
             </div>
           </div>
           <div style={{
-            height: 3, background: '#1c2a1c', borderRadius: 2,
+            height: 3, background: 'var(--ok-bg, #1c2a1c)', borderRadius: 2,
             overflow: 'hidden', marginBottom: 6,
           }}>
             <div style={{
               height: '100%', width: buildPct + '%',
-              background: '#22c55e', borderRadius: 2, transition: 'width 0.4s ease',
+              background: 'var(--ok, #22c55e)', borderRadius: 2, transition: 'width 0.4s ease',
             }} />
           </div>
-          <div style={{ fontSize: 10, color: '#86efac', fontFamily: 'var(--mono)' }}>
+          <div style={{ fontSize: 10, color: 'var(--ok-soft, #86efac)', fontFamily: 'var(--mono)' }}>
             {buildLog[buildLog.length - 1] || '…'}
           </div>
         </div>
@@ -530,7 +530,7 @@ function ChatPanel({ repo, analysis, history, setHistory, onClose, ragStatus, bu
         {error && (
           <div style={{
             padding: '8px 12px', borderRadius: 8, marginBottom: 10,
-            background: '#2d1b1b', border: '1px solid var(--red)',
+            background: 'var(--err-bg, #2d1b1b)', border: '1px solid var(--red)',
             color: 'var(--red)', fontSize: 11,
           }}>
             Error: {error}
@@ -845,7 +845,7 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
               {modules.slice(0, 12).map(m => {
                 const cc   = typeof m.avg_cc === 'number' ? m.avg_cc : 1
                 const rank = m.cc_rank || 'A'
-                const rankColor = { A: '#22c55e', B: '#86efac', C: '#facc15', D: '#fb923c', E: '#ef4444', F: '#dc2626' }[rank] || '#94a3b8'
+                const rankColor = { A: 'var(--rank-a, #22c55e)', B: 'var(--rank-b, #86efac)', C: 'var(--rank-c, #facc15)', D: 'var(--orange)', E: 'var(--rank-e, #ef4444)', F: 'var(--rank-f, #dc2626)' }[rank] || 'var(--rank-x, #94a3b8)'
                 const bugs = typeof m.halstead_bugs === 'number' ? m.halstead_bugs.toFixed(3) : '—'
                 const vol  = typeof m.halstead_volume === 'number' ? Math.round(m.halstead_volume) : 0
                 return (
@@ -879,7 +879,7 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
                   <div key={c} style={{
                     padding: '5px 12px',
                     background: 'var(--accent-dim)',
-                    border: '1px solid rgba(93,142,255,0.25)',
+                    border: '1px solid color-mix(in srgb, var(--accent) 25%, transparent)',
                     borderRadius: 20, fontSize: 12, fontWeight: 500,
                     display: 'flex', alignItems: 'center', gap: 6,
                   }}>
@@ -895,7 +895,7 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
               </div>
               {metrics.most_called_class && (
                 <div style={{ fontSize: 11, color: 'var(--txt3)' }}>
-                  Most-called class: <span style={{ color: '#a78bfa' }}>{metrics.most_called_class}</span>
+                  Most-called class: <span style={{ color: 'var(--purple)' }}>{metrics.most_called_class}</span>
                   {' '}· Total lines: <span style={{ color: 'var(--txt)' }}>{metrics.total_lines?.toLocaleString()}</span>
                 </div>
               )}
@@ -944,13 +944,13 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
           position: 'fixed', bottom: 28, right: 28, zIndex: 1000,
           width: 52, height: 52, borderRadius: '50%',
           background: 'var(--accent)', border: 'none',
-          boxShadow: '0 4px 16px rgba(93,142,255,0.45)',
+          boxShadow: '0 4px 16px color-mix(in srgb, var(--accent) 45%, transparent)',
           cursor: 'pointer',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           transition: 'transform 0.15s, box-shadow 0.15s',
         }}
-        onMouseOver={e => { e.currentTarget.style.transform = 'scale(1.08)'; e.currentTarget.style.boxShadow = '0 6px 22px rgba(93,142,255,0.6)' }}
-        onMouseOut={e  => { e.currentTarget.style.transform = 'scale(1)';    e.currentTarget.style.boxShadow = '0 4px 16px rgba(93,142,255,0.45)' }}
+        onMouseOver={e => { e.currentTarget.style.transform = 'scale(1.08)'; e.currentTarget.style.boxShadow = '0 6px 22px color-mix(in srgb, var(--accent) 60%, transparent)' }}
+        onMouseOut={e  => { e.currentTarget.style.transform = 'scale(1)';    e.currentTarget.style.boxShadow = '0 4px 16px color-mix(in srgb, var(--accent) 45%, transparent)' }}
       >
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
@@ -959,7 +959,7 @@ export default function AnalyzePage({ task, selectedRepo, analysis, setAnalysis,
           <span style={{
             position: 'absolute', top: -4, right: -4,
             minWidth: 18, height: 18, borderRadius: 9,
-            background: '#22c55e', color: 'white',
+            background: 'var(--ok, #22c55e)', color: 'white',
             fontSize: 10, fontWeight: 700,
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             padding: '0 4px',
