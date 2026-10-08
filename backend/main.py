@@ -48,7 +48,7 @@ from auth import (
     create_user, authenticate_user,
     generate_reset_token, reset_password,
     create_access_token, get_current_user, get_optional_user,
-    send_reset_email,
+    send_reset_email, MIN_PASSWORD_LEN,
 )
 from history_db import (
     history_create, history_update,
@@ -154,8 +154,8 @@ async def health():
 
 @app.post("/api/auth/register")
 async def register(req: RegisterRequest):
-    if len(req.password) < 6:
-        raise HTTPException(400, "Password must be at least 6 characters")
+    if len(req.password) < MIN_PASSWORD_LEN:
+        raise HTTPException(400, f"Password must be at least {MIN_PASSWORD_LEN} characters")
     if len(req.username.strip()) < 2:
         raise HTTPException(400, "Username must be at least 2 characters")
     try:

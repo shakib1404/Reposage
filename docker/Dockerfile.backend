@@ -97,18 +97,25 @@ ENV GIT_AUTHOR_NAME="RepoSage Agent" \
     GIT_COMMITTER_NAME="RepoSage Agent" \
     GIT_COMMITTER_EMAIL="agent@reposage.local"
 
-# This container runs code from arbitrary public repositories, so it runs as
-# an unprivileged user and writes only under /data (a volume) and /tmp.
+# This container runs code from arbitrary public repositories, so the app runs
+# as an unprivileged user and writes only under /data (a volume) and /tmp.
+#
+# The entrypoint starts as root just long enough to fix /data's ownership (a
+# platform volume mounts over it root-owned) and then drops to `reposage` —
+# see docker/entrypoint.sh. Without it a volume is unwritable for that user.
 RUN useradd --create-home --uid 10001 reposage \
-    && mkdir -p /data/outputs /data/outputs/taskexec \
+    && mkdir -p /data/outputs /data/outputs/taskexec /data/corpus \
     && chown -R reposage:reposage /app /data /opt/repo-task-executor
-USER reposage
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
-ENV EXECUTOR_OUTPUT_ROOT=/data/outputs
+ENV EXECUTOR_OUTPUT_ROOT=/data/outputs \
+    CORPUS_ROOT=/data/corpus
 
 EXPOSE 8000
 
 # --workers 1 is deliberate: the reranker model is held in process memory and
 # a second worker would double the ~500MB resident footprint for no gain —
 # this workload is I/O- and subprocess-bound, not request-throughput-bound.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

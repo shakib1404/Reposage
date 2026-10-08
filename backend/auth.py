@@ -43,6 +43,26 @@ JWT_EXPIRE_DAYS    = 7
 RESET_EXPIRE_HOURS = 1
 DB_NAME            = "repomaster"
 BCRYPT_ROUNDS      = 10   # 10 ≈ 50ms; 12 ≈ 200ms — both are secure
+MIN_PASSWORD_LEN   = 6    # one rule for register AND reset
+
+def frontend_url() -> str:
+    """Where the SPA lives, for links put in e-mails.
+
+    FRONTEND_URL wins. Otherwise the first non-localhost origin in
+    CORS_ALLOW_ORIGINS (in a split Vercel + Railway deployment that IS the
+    frontend). The default is only the local dev server. Deliberately NOT taken
+    from the request's Origin header: that is attacker-controlled, and a reset
+    link built from it would let anyone get a victim's reset token e-mailed to
+    their own site.
+    """
+    explicit = os.getenv("FRONTEND_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(","):
+        origin = origin.strip()
+        if origin.startswith("https://"):
+            return origin.rstrip("/")
+    return "http://localhost:5173"
 
 # ── MongoDB (shared client) ───────────────────────────────────────────────────
 _mongo_client: Optional[AsyncIOMotorClient] = None
@@ -193,6 +213,12 @@ async def generate_reset_token(email: str) -> str:
     return token
 
 async def reset_password(token: str, new_password: str) -> bool:
+    # Registration refuses a password under MIN_PASSWORD_LEN; the reset path
+    # did not, so "forgot password" was a way round the rule (even "" passed).
+    if len(new_password) < MIN_PASSWORD_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {MIN_PASSWORD_LEN} characters")
     db   = get_db()
     user = await db["users"].find_one({"reset_token": token})
     if not user:
@@ -213,9 +239,14 @@ async def reset_password(token: str, new_password: str) -> bool:
 
 # ── Gmail email sender ────────────────────────────────────────────────────────
 def send_reset_email(to_email: str, token: str,
-                     frontend_url: str = "http://localhost:5173") -> None:
-    """Send a password-reset email via Gmail SMTP SSL."""
-    reset_link = f"{frontend_url}?reset_token={token}"
+                     base_url: Optional[str] = None) -> None:
+    """Send a password-reset email via Gmail SMTP SSL.
+
+    The link used to default to http://localhost:5173 and the route never
+    passed anything else, so every reset e-mail sent from production pointed at
+    the recipient's own machine.
+    """
+    reset_link = f"{(base_url or frontend_url()).rstrip('/')}?reset_token={token}"
 
     msg           = MIMEMultipart("alternative")
     msg["Subject"] = "RepoSage — Reset your password"
