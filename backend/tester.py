@@ -281,7 +281,8 @@ async def run_test_loop(
         # examples are still reported in full, but a test file full of asserts
         # is not a defect in the library, and counting it as one is what made
         # every mature repo grade F.
-        sev_counts     = _count_severities(all_findings, area="source")
+        graded         = _dedupe_cross_tool(all_findings)
+        sev_counts     = _count_severities(graded, area="source")
         sev_counts_all = _count_severities(all_findings)
         source_loc     = _source_loc(workspace)
         score, grade   = _compute_score(sev_counts, source_loc)
@@ -303,6 +304,9 @@ async def run_test_loop(
             "elapsed_s":   elapsed,
             "total":       len(all_findings),
             "graded_on":   sum(sev_counts.values()),
+            # reports of one line by several tools, counted once in the grade
+            "duplicates_collapsed": len([f for f in all_findings if f.get("area", "source") == "source"])
+                                    - len([f for f in graded if f.get("area", "source") == "source"]),
             "source_loc":  source_loc,
             "severity":    sev_counts,       # source only — what the grade uses
             "severity_all": sev_counts_all,  # everything, for the full picture
@@ -320,7 +324,7 @@ async def run_test_loop(
             yield _ev("status", "Audit report saved",
                       f"audit_report.json — {len(all_findings)} findings")
 
-        non_source = len(all_findings) - sum(sev_counts.values())
+        non_source = sum(n for a, n in by_area.items() if a != "source")
         yield _ev("done",
                   f"Audit complete — Grade {grade}  ({score}/100)",
                   f"{sev_counts['critical']} critical · "
@@ -396,7 +400,7 @@ async def _scan_lint(workspace: str, venv_path: str) -> list[dict]:
         workspace, timeout=TOOL_TIMEOUT)
     findings = []
     try:
-        data = json.loads(out)
+        data = _json_from(out)
         for item in data:
             code = item.get("code") or ""
             # B = bugbear (genuine bug shapes), C90 = over-complex functions,
@@ -440,60 +444,242 @@ async def _scan_security(workspace: str, venv_path: str) -> list[dict]:
         workspace, timeout=TOOL_TIMEOUT)
     findings = []
     sev_map = {"HIGH": "high", "MEDIUM": "medium", "LOW": "low"}
-    try:
-        data = json.loads(out)
-        for item in data.get("results", []):
-            sev_raw  = item.get("issue_severity", "LOW")
-            conf_raw = item.get("issue_confidence", "LOW")
-            sev = "critical" if (sev_raw == "HIGH" and conf_raw == "HIGH") \
-                  else sev_map.get(sev_raw, "low")
-            findings.append(_finding(
-                scanner="security", severity=sev,
-                file=_rel(item.get("filename", ""), workspace),
-                line=item.get("line_number", 0),
-                rule=item.get("test_id", ""),
-                message=item.get("issue_text", ""),
-                confidence=conf_raw,
-            ))
-    except Exception:
-        pass
+    data = _json_or_raise(out, "bandit") or {}
+    for item in data.get("results", []):
+        sev_raw  = item.get("issue_severity", "LOW")
+        conf_raw = item.get("issue_confidence", "LOW")
+        sev = "critical" if (sev_raw == "HIGH" and conf_raw == "HIGH") \
+              else sev_map.get(sev_raw, "low")
+        findings.append(_finding(
+            scanner="security", severity=sev,
+            file=_rel(item.get("filename", ""), workspace),
+            line=item.get("line_number", 0),
+            rule=item.get("test_id", ""),
+            message=item.get("issue_text", ""),
+            confidence=conf_raw,
+        ))
     return findings[:500]
 
 
 # ── deps ──────────────────────────────────────────────────────────────────────
+#
+# What gets audited: every Python dependency manifest the repo declares, not
+# only a root requirements.txt —
+#   requirements*.txt (root, and requirements/ style sub-folders)
+#   pyproject.toml    [project] dependencies and optional-dependencies
+#   poetry.lock, Pipfile.lock   (exact pinned versions)
+# Nothing in the repo is executed to read them (no setup.py, no build step):
+# the manifests are only parsed, and pip-audit does the resolving.
+#
+# Resolving can fail for reasons unrelated to security — conflicting pins, or
+# an old sdist that will not build on this Python. When it does, the pinned
+# `name==version` lines are audited directly (--no-deps --disable-pip), so a
+# resolver failure does not become a silent "0 vulnerabilities".
+
+_PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._\-]*)(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9._+!\-]+)\s*$")
+_REQ_SKIP_DIRS = VENDOR_DIR_NAMES | {"node_modules", "build", "dist", ".git"}
+
+
+def _strip_req_line(line: str) -> str:
+    return line.split(" #")[0].split("\t#")[0].strip() if "#" in line else line.strip()
+
+
+def _requirement_files(workspace: str) -> list[str]:
+    """Relative paths of requirements*.txt, at the root and one level down."""
+    found: list[str] = []
+    for root, dirs, files in os.walk(workspace):
+        depth = os.path.relpath(root, workspace).count(os.sep) if root != workspace else 0
+        dirs[:] = [d for d in dirs if d not in _REQ_SKIP_DIRS and not d.startswith(".")]
+        if depth >= 2:
+            dirs[:] = []
+        for fn in sorted(files):
+            if re.fullmatch(r"requirements[-_.\w]*\.txt", fn, re.I) or \
+               (os.path.basename(root).lower() in ("requirements", "reqs", "requirement")
+                and fn.endswith(".txt")):
+                rel = os.path.relpath(os.path.join(root, fn), workspace)
+                # A requirements file under tests/, docs/ or examples/ pins
+                # tooling for those, not what ships. (Not _classify_area: it
+                # files every *.txt under "docs", which is right for findings
+                # but would skip requirements/prod.txt here.)
+                parts = {c.lower() for c in rel.split(os.sep)[:-1]}
+                if parts & {"test", "tests", "doc", "docs", "example", "examples",
+                            "sample", "samples", "benchmark", "benchmarks"}:
+                    continue
+                found.append(rel)
+    return found[:6]
+
+
+def _manifest_requirements(workspace: str) -> list[tuple[str, list[str]]]:
+    """(label, requirement lines) for pyproject.toml and the lock files."""
+    out: list[tuple[str, list[str]]] = []
+
+    def read(name):
+        path = os.path.join(workspace, name)
+        if not os.path.isfile(path) or os.path.getsize(path) > 5_000_000:
+            return None
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+    raw = read("pyproject.toml")
+    if raw:
+        try:
+            import tomllib
+            data = tomllib.loads(raw.decode("utf-8", "replace"))
+            proj = data.get("project") or {}
+            lines = [d for d in proj.get("dependencies", []) if isinstance(d, str)]
+            for extra in (proj.get("optional-dependencies") or {}).values():
+                lines += [d for d in extra if isinstance(d, str)]
+            if lines:
+                out.append(("pyproject.toml", lines))
+        except Exception:
+            pass
+
+    raw = read("poetry.lock")
+    if raw:
+        try:
+            import tomllib
+            pkgs = tomllib.loads(raw.decode("utf-8", "replace")).get("package", [])
+            lines = [f"{p['name']}=={p['version']}" for p in pkgs
+                     if p.get("name") and p.get("version")]
+            if lines:
+                out.append(("poetry.lock", lines))
+        except Exception:
+            pass
+
+    raw = read("Pipfile.lock")
+    if raw:
+        try:
+            data = json.loads(raw.decode("utf-8", "replace"))
+            lines = []
+            for section in ("default", "develop"):
+                for name, meta in (data.get(section) or {}).items():
+                    ver = (meta or {}).get("version", "")
+                    if ver.startswith("=="):
+                        lines.append(f"{name}{ver}")
+            if lines:
+                out.append(("Pipfile.lock", lines))
+        except Exception:
+            pass
+    return out
+
+
+def _parse_audit(out: str):
+    """pip-audit JSON -> list of dependency dicts, or None if unreadable."""
+    try:
+        raw = _json_from(out)
+    except ValueError:
+        return None
+    deps = raw if isinstance(raw, list) else raw.get("dependencies")
+    return deps if isinstance(deps, list) else None
+
+
+def _audit_error(out: str) -> str:
+    """The most informative line pip-audit printed when it failed."""
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    for l in lines:
+        if "ResolutionImpossible" in l or "conflicting dependencies" in l or \
+           "Failed to install" in l or l.startswith("ERROR"):
+            return l[:220]
+    return (lines[-1] if lines else "no output")[:220]
+
 
 async def _scan_deps(workspace: str, venv_path: str) -> list[dict]:
     pip = _pip(venv_path)
     await _run([pip, "install", "pip-audit", "--quiet"], workspace, timeout=60)
     pa = _tool(venv_path, "pip-audit")
 
-    req_file = next(
-        (rf for rf in ("requirements.txt", "requirements-dev.txt",
-                       "requirements-test.txt")
-         if os.path.isfile(os.path.join(workspace, rf))),
-        None,
-    )
-    cmd = [pa, "--format", "json", "--progress-spinner", "off"]
-    if req_file:
-        cmd += ["-r", req_file]
+    # (label, real requirements file or None, requirement lines)
+    sources: list[tuple[str, str | None, list[str]]] = []
+    for rel in _requirement_files(workspace):
+        try:
+            with open(os.path.join(workspace, rel), encoding="utf-8", errors="ignore") as fh:
+                lines = [_strip_req_line(l) for l in fh]
+        except OSError:
+            continue
+        sources.append((rel, os.path.join(workspace, rel), [l for l in lines if l and not l.startswith(("#", "-"))]))
+    for label, lines in _manifest_requirements(workspace):
+        sources.append((label, None, lines))
 
-    ok, out = await _run(cmd, workspace, timeout=TOOL_TIMEOUT)
-    findings = []
+    if not sources:
+        return [_finding(
+            scanner="deps", severity="info", file="", line=0, rule="DEPS000",
+            message="No Python dependency manifest found (requirements*.txt, "
+                    "pyproject.toml, poetry.lock, Pipfile.lock). Dependency "
+                    "audit skipped — this is not a clean result.")]
+
+    findings: list[dict] = []
+    seen: dict[tuple[str, str], dict] = {}
+    tmpdir = tempfile.mkdtemp(prefix="deps_")
     try:
-        raw = json.loads(out)
-        deps_list = raw if isinstance(raw, list) else raw.get("dependencies", [])
-        for dep in deps_list:
-            for vuln in dep.get("vulns", []):
-                vid = vuln.get("id", "")
-                sev = "high" if vid.upper().startswith("CVE") else "medium"
-                findings.append(_finding(
-                    scanner="deps", severity=sev,
-                    file=f"{dep.get('name','')}=={dep.get('version','')}",
-                    line=0, rule=vid,
-                    message=(vuln.get("description") or "")[:200],
-                ))
-    except Exception:
-        pass
+        for idx, (label, req_path, lines) in enumerate(sources[:6]):
+            if req_path is None:
+                req_path = os.path.join(tmpdir, f"manifest_{idx}.txt")
+                with open(req_path, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(lines) + "\n")
+            base = [pa, "--format", "json", "--progress-spinner", "off"]
+            ok, out = await _run(base + ["-r", req_path], workspace, timeout=TOOL_TIMEOUT)
+            deps = _parse_audit(out)
+            note = ""
+            if deps is None:
+                # Resolution failed: audit the exact pins directly.
+                pinned = sorted({f"{m.group(1)}=={m.group(2)}" for l in lines
+                                 if (m := _PIN.match(l.split(";")[0].strip()))})
+                reason = _audit_error(out)
+                if pinned:
+                    pin_file = os.path.join(tmpdir, f"pins_{idx}.txt")
+                    with open(pin_file, "w", encoding="utf-8") as fh:
+                        fh.write("\n".join(pinned) + "\n")
+                    ok, out2 = await _run(base + ["--no-deps", "--disable-pip", "-r", pin_file],
+                                          workspace, timeout=TOOL_TIMEOUT)
+                    deps = _parse_audit(out2)
+                    note = " (audited from exact pins; full resolution failed)"
+                if deps is None:
+                    findings.append(_finding(
+                        scanner="deps", severity="info", file=label, line=0,
+                        rule="DEPS001",
+                        message=f"Dependency audit of {label} could not run: "
+                                f"{reason}. Its dependencies were NOT checked."))
+                    continue
+            for dep in deps:
+                vulns = dep.get("vulns") or []
+                if not vulns:
+                    continue
+                key = (str(dep.get("name", "")).lower(), str(dep.get("version", "")))
+                rec = seen.setdefault(key, {"name": dep.get("name", ""), "version": dep.get("version", ""),
+                                            "vulns": {}, "labels": set(), "note": note})
+                rec["labels"].add(label)
+                for v in vulns:
+                    rec["vulns"].setdefault(v.get("id", ""), v)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # One finding per vulnerable package, not per advisory. An old Django pin
+    # carries dozens of advisories; counted one by one it would outweigh every
+    # other finding in the report combined. The advisories are all listed in
+    # the message, and the package is still exactly one thing to upgrade.
+    for (_, _), rec in sorted(seen.items()):
+        vulns = list(rec["vulns"].values())
+        ids = [v.get("id", "") for v in vulns]
+        has_cve = any(i.upper().startswith("CVE") or
+                      any(str(a).upper().startswith("CVE") for a in (v.get("aliases") or []))
+                      for v in vulns for i in [v.get("id", "")])
+        fixes = sorted({f for v in vulns for f in (v.get("fix_versions") or [])},
+                       key=lambda x: [int(t) if t.isdigit() else 0 for t in re.split(r"[.\-]", x)])
+        n = len(vulns)
+        first = ids[0] if ids else ""
+        findings.append(_finding(
+            scanner="deps", severity="high" if has_cve else "medium",
+            file=f"{rec['name']}=={rec['version']}", line=0,
+            rule=first + (f" (+{n - 1} more)" if n > 1 else ""),
+            message=(f"{n} known vulnerabilit{'y' if n == 1 else 'ies'} in "
+                     f"{rec['name']} {rec['version']} (declared in "
+                     f"{', '.join(sorted(rec['labels']))}){rec['note']}. "
+                     + (f"Fixed in: {', '.join(fixes[:4])}. " if fixes else "No fixed version published. ")
+                     + "Advisories: " + ", ".join(ids[:6]) + (" …" if n > 6 else "")),
+        ))
     return findings
 
 
@@ -570,22 +756,19 @@ async def _scan_secrets(workspace: str, venv_path: str) -> list[dict]:
     ok, out = await _run([ds, "scan", "--all-files"],
                           workspace, timeout=TOOL_TIMEOUT)
     findings = []
-    try:
-        data = json.loads(out)
-        for fpath, secrets in data.get("results", {}).items():
-            rel = _rel(fpath, workspace)
-            for secret in secrets:
-                stype = secret.get("type", "secret")
-                findings.append(_finding(
-                    scanner="secrets",
-                    severity=_secret_severity(stype, rel),
-                    file=rel,
-                    line=secret.get("line_number", 0),
-                    rule=stype,
-                    message=f"Potential {stype} detected (value hashed)",
-                ))
-    except Exception:
-        pass
+    data = _json_or_raise(out, "detect-secrets") or {}
+    for fpath, secrets in data.get("results", {}).items():
+        rel = _rel(fpath, workspace)
+        for secret in secrets:
+            stype = secret.get("type", "secret")
+            findings.append(_finding(
+                scanner="secrets",
+                severity=_secret_severity(stype, rel),
+                file=rel,
+                line=secret.get("line_number", 0),
+                rule=stype,
+                message=f"Potential {stype} detected (value hashed)",
+            ))
     return findings
 
 
@@ -595,20 +778,33 @@ async def _scan_deadcode(workspace: str, venv_path: str) -> list[dict]:
     pip = _pip(venv_path)
     await _run([pip, "install", "vulture", "--quiet"], workspace, timeout=60)
     vulture = _tool(venv_path, "vulture")
-    ok, out = await _run([vulture, ".", "--min-confidence", "80"],
+    # Vulture rates unused imports / unreachable code / unused arguments at
+    # 90-100% but an unused function or class at only 60%, because in a
+    # library "nobody here calls it" usually means "it is public API". A flat
+    # 80% cut therefore hid every forgotten function and class. Run at 60% and
+    # keep a 60% finding only where it is not ambiguous: a PRIVATE (single
+    # leading underscore) function, method or class that nothing in the repo
+    # references by name cannot be reached from outside either.
+    ok, out = await _run([vulture, ".", "--min-confidence", "60"],
                           workspace, timeout=TOOL_TIMEOUT)
     findings = []
-    for line in out.splitlines()[:300]:
+    for line in out.splitlines()[:600]:
         # path/file.py:42: unused function 'foo' (80% confidence)
         m = re.match(r"(.+?):(\d+): (.+?) \((\d+)% confidence\)", line)
-        if m:
-            findings.append(_finding(
-                scanner="deadcode", severity="low",
-                file=_rel(m.group(1), workspace),
-                line=int(m.group(2)), rule="dead_code",
-                message=m.group(3),
-                confidence=m.group(4) + "%",
-            ))
+        if not m:
+            continue
+        conf, msg = int(m.group(4)), m.group(3)
+        if conf < 80:
+            nm = re.match(r"unused (function|method|class) '(_[^_][^']*|_)'$", msg)
+            if not nm:
+                continue
+        findings.append(_finding(
+            scanner="deadcode", severity="low",
+            file=_rel(m.group(1), workspace),
+            line=int(m.group(2)), rule="dead_code",
+            message=msg,
+            confidence=m.group(4) + "%",
+        ))
     return findings[:300]
 
 
@@ -634,26 +830,23 @@ async def _scan_semgrep(workspace: str, venv_path: str) -> list[dict]:
         workspace, timeout=SEMGREP_TIMEOUT)
     findings = []
     sev_map = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
-    try:
-        data = json.loads(out)
-        for item in data.get("results", []):
-            extra    = item.get("extra") or {}
-            sev_raw  = (extra.get("severity") or "INFO").upper()
-            conf_raw = ((extra.get("metadata") or {}).get("confidence") or "").upper()
-            # Mirror the bandit escalation rule: only the strongest signal
-            # (rule author says ERROR *and* HIGH confidence) counts as critical.
-            sev = "critical" if (sev_raw == "ERROR" and conf_raw == "HIGH") \
-                  else sev_map.get(sev_raw, "low")
-            findings.append(_finding(
-                scanner="semgrep", severity=sev,
-                file=_rel(item.get("path", ""), workspace),
-                line=(item.get("start") or {}).get("line", 0),
-                rule=(item.get("check_id") or "").split(".")[-1],
-                message=extra.get("message", ""),
-                confidence=conf_raw,
-            ))
-    except Exception:
-        pass
+    data = _json_or_raise(out, "semgrep") or {}
+    for item in data.get("results", []):
+        extra    = item.get("extra") or {}
+        sev_raw  = (extra.get("severity") or "INFO").upper()
+        conf_raw = ((extra.get("metadata") or {}).get("confidence") or "").upper()
+        # Mirror the bandit escalation rule: only the strongest signal
+        # (rule author says ERROR *and* HIGH confidence) counts as critical.
+        sev = "critical" if (sev_raw == "ERROR" and conf_raw == "HIGH") \
+              else sev_map.get(sev_raw, "low")
+        findings.append(_finding(
+            scanner="semgrep", severity=sev,
+            file=_rel(item.get("path", ""), workspace),
+            line=(item.get("start") or {}).get("line", 0),
+            rule=(item.get("check_id") or "").split(".")[-1],
+            message=extra.get("message", ""),
+            confidence=conf_raw,
+        ))
     return findings[:500]
 
 
@@ -1634,6 +1827,49 @@ def _attach_snippets(findings: list[dict], workspace: str) -> None:
         f["code_start"] = start
 
 
+# Tools that look at the same kinds of defect, so one real problem on one line
+# is reported once per tool: `eval(request.args["c"])` was counted once by
+# bandit (B307) and three times by semgrep. Measured on a fixture with planted
+# bugs, 53 graded findings were only 32 distinct locations. Counting every tool
+# separately made the grade a measure of how many tools overlap on the repo.
+_OVERLAP_GROUPS = (
+    ("security", "semgrep", "secrets"),      # vulnerability / credential tools
+    ("lint", "deadcode"),                    # unused-name reports (F401 vs vulture)
+)
+_SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+
+def _dedupe_cross_tool(findings: list[dict]) -> list[dict]:
+    """The findings that count toward the grade.
+
+    Within one overlap group, a (file, line) that several tools flagged is
+    counted through ONE tool: the one that rated it most severe (ties go to the
+    earlier tool in the group). Everything that tool said about the line is
+    kept, so two genuinely different bandit rules on one line both count.
+    Findings with no line (graph analysis, dependencies) are never merged, and
+    nothing is removed from the report itself — only from the arithmetic.
+    """
+    group_of = {sc: gi for gi, g in enumerate(_OVERLAP_GROUPS) for sc in g}
+    best: dict[tuple, tuple[int, int, str]] = {}
+    for f in findings:
+        gi = group_of.get(f.get("scanner"))
+        if gi is None or not f.get("line"):
+            continue
+        key = (gi, f.get("file", ""), f["line"])
+        order = _OVERLAP_GROUPS[gi].index(f["scanner"])
+        cand = (_SEV_RANK.get(f.get("severity", "info"), 0), -order, f["scanner"])
+        if key not in best or cand > best[key]:
+            best[key] = cand
+    out = []
+    for f in findings:
+        gi = group_of.get(f.get("scanner"))
+        if gi is None or not f.get("line"):
+            out.append(f); continue
+        if best[(gi, f.get("file", ""), f["line"])][2] == f["scanner"]:
+            out.append(f)
+    return out
+
+
 def _count_severities(findings: list[dict], area: str | None = None) -> dict[str, int]:
     """Severity histogram, optionally restricted to one area of the repo."""
     counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
@@ -1713,7 +1949,44 @@ def _rel(path: str, workspace: str) -> str:
     try:
         return str(Path(path).relative_to(workspace))
     except ValueError:
-        return path
+        # bandit reports "./pkg/mod.py" while every other scanner reports
+        # "pkg/mod.py"; one file must have one name in the report.
+        return path[2:] if path.startswith("./") else path
+
+
+def _json_from(out: str):
+    """The first JSON document in a tool's output.
+
+    _run() returns stdout and stderr concatenated, so any tool that prints its
+    JSON on stdout and a summary on stderr breaks a plain json.loads() with
+    "Extra data". pip-audit does exactly that ("Found 57 known vulnerabilities
+    in 5 packages"), which made the dependency scanner report 0 findings for a
+    repo with 57 of them.
+    """
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(out):
+        if ch in "{[":
+            try:
+                return dec.raw_decode(out, i)[0]
+            except ValueError:
+                continue
+    raise ValueError("no JSON document in tool output")
+
+
+def _json_or_raise(out: str, tool: str):
+    """Parse a scanner's JSON, or fail loudly.
+
+    A scanner that cannot read its tool's output used to return [] and the
+    report said "0 findings", indistinguishable from a clean repository. An
+    exception surfaces as a scanner_error event instead.
+    """
+    if not out.strip():
+        return None
+    try:
+        return _json_from(out)
+    except ValueError:
+        raise RuntimeError(f"{tool} produced unreadable output: "
+                           f"{' '.join(out.split())[:200]}")
 
 
 def _find_req_files(workspace: str) -> list[str]:

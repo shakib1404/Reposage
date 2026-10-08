@@ -419,6 +419,11 @@ export default function TestPage({ selectedRepo, jobId, setTestResult, unlock, g
                 <span style={{ color: 'var(--txt2)', fontWeight: 600 }}>
                   Graded on {report.graded_on ?? 0} finding{(report.graded_on ?? 0) === 1 ? '' : 's'} in source
                 </span>
+                {(report.duplicates_collapsed ?? 0) > 0 && (
+                  <span title="Several tools flagged the same line; the grade counts it once, through the tool that rated it most severe. All of them stay listed below.">
+                    · {report.duplicates_collapsed} repeat report{report.duplicates_collapsed === 1 ? '' : 's'} of the same line <span style={{ opacity: 0.6 }}>(counted once)</span>
+                  </span>
+                )}
                 {Object.entries(report.by_area)
                   .filter(([a]) => a !== 'source')
                   .map(([area, n]) => (
