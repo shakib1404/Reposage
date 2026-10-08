@@ -22,6 +22,22 @@ import tempfile
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
+
+def clone_error_message(repo_ref: str, err: bytes) -> str:
+    """Turn raw git clone stderr into something a user can act on.
+
+    GitHub answers a missing or misspelt repository with an auth prompt
+    ("could not read Username"), which reads like a login problem.  It almost
+    always means the URL is wrong or the repository is private.
+    """
+    text = err.decode(errors="ignore")
+    low = text.lower()
+    if any(k in low for k in ("could not read username", "repository not found",
+                              "authentication failed", "terminal prompts disabled")):
+        return (f"Repository not found or private: {repo_ref} — "
+                "check the URL for typos (it must be a public repository).")
+    return f"git clone failed: {text[:300]}"
+
 log = logging.getLogger(__name__)
 
 DEFAULT_THRESHOLD = 0.68   # calibrated: true near-duplicates scored 0.71-0.89, unrelated pairs stayed <=0.46
@@ -138,6 +154,7 @@ async def find_semantic_duplicates(
             proc = await asyncio.create_subprocess_exec(
                 "git", "clone", "--depth", "1", repo_ref, tmp_dir,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo"},
             )
             try:
                 _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
@@ -145,7 +162,7 @@ async def find_semantic_duplicates(
                 yield {"type": "error", "message": "git clone timed out"}
                 return
             if proc.returncode != 0:
-                yield {"type": "error", "message": f"git clone failed: {err.decode(errors='ignore')[:300]}"}
+                yield {"type": "error", "message": clone_error_message(repo_ref, err)}
                 return
             workspace = tmp_dir
         else:

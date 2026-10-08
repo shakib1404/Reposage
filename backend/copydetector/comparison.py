@@ -62,6 +62,14 @@ class Comparison:
     """
     slices2: tuple[Slice, ...]
 
+    """Copied regions as (slice in file 1, the slice in file 2 it was copied
+    to/from). slices1 and slices2 are two INDEPENDENT lists, each ordered by
+    position in its own file, so slices1[i] is not the counterpart of slices2[i]
+    when the same code sits in a different order in the two files (it is not
+    even the same length: 30 regions against 28 on uQR.py vs qrcode/util.py).
+    Empty means "not computed"; callers fall back to zip(slices1, slices2)."""
+    pairs: tuple[tuple[Slice, Slice], ...] = ()
+
     def __lt__(self, other: "Comparison") -> bool:
         oursim = self.similarity1 + self.similarity2
         theirsim = other.similarity1 + other.similarity2

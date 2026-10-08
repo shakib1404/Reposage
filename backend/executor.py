@@ -305,6 +305,10 @@ async def run_execution_loop(
         not_runnable_reason  — detailed explanation string
     """
     metrics    = _fresh_metrics()
+    # Env vars for THIS job only. Writing them to os.environ leaked them into
+    # every later job in the same server process: one repo's
+    # DJANGO_SETTINGS_MODULE=config.settings broke every Django repo after it.
+    job_env: dict[str, str] = {}
     workspace: Optional[str] = None
     venv_path: Optional[str] = None
     fix_journal: list[dict]  = []
@@ -468,7 +472,7 @@ async def run_execution_loop(
                 submitted = CREDENTIAL_STORE.pop(job_id, {})
                 for k, v in submitted.items():
                     if k and v:
-                        os.environ[str(k)] = str(v)
+                        job_env[str(k)] = str(v)
                 yield _ev("explore",
                           f"Credentials received ({len(submitted)})",
                           "✓ Injected as environment variables.",
@@ -485,7 +489,7 @@ async def run_execution_loop(
         env_export_lines: list[str] = []
         for k, v in llm_plan.get("env_vars", {}).items():
             if k and v and str(v).upper() not in ("YOUR_VALUE_HERE", "REPLACE_ME", ""):
-                os.environ.setdefault(str(k), str(v))
+                job_env.setdefault(str(k), str(v))
                 env_export_lines.append(f'export {k}="{v}"')
 
         # ── 10. Extra deps from LLM ────────────────────────────────────────────
@@ -495,7 +499,7 @@ async def run_execution_loop(
             for dep in extra_deps[:15]:
                 dep = _sanitise(str(dep))
                 if dep:
-                    ok, out = await _run_cmd([pip, "install", dep], workspace, timeout=120)
+                    ok, out = await _run_cmd([pip, "install", dep], workspace, timeout=120, env=job_env)
                     yield _ev("exec", f"Extra dep: {dep}",
                               "✓ installed" if ok else f"⚠ failed: {out[:200]}",
                               tool="deps.extra", metrics=metrics)
@@ -517,7 +521,7 @@ async def run_execution_loop(
                     yield _ev("feedback", f"Blocked unsafe pre-run step: {step[:60]}",
                               "Skipped for safety.", tool="setup.pre_run", metrics=metrics)
                     continue
-                ok, out = await _run_cmd(["bash", "-c", step], workspace, timeout=300)
+                ok, out = await _run_cmd(["bash", "-c", step], workspace, timeout=300, env=job_env)
                 pre_steps_done.append(step)
                 yield _ev("exec", f"Pre-run: {step[:60]}",
                           ("✓ done" if ok else "⚠ non-zero") + f"\n{out[:400]}",
@@ -577,7 +581,7 @@ async def run_execution_loop(
 
             final_rc, final_stdout, final_stderr = await _run_direct(
                 run_cmd, workspace, venv_path or "",
-                is_gui=_targets_gui(run_cmd, workspace))
+                is_gui=_targets_gui(run_cmd, workspace), extra_env=job_env)
 
             elapsed    = round(time.monotonic() - t_attempt, 2)
             run_output = _fmt_output(final_rc, final_stdout, final_stderr)
@@ -719,7 +723,7 @@ async def run_execution_loop(
                       code=fix.get("detail", "")[:1500],
                       tool="feedback.fix", metrics=metrics)
 
-            await _apply_fix(fix, workspace, venv_path or "")
+            await _apply_fix(fix, workspace, venv_path or "", job_env)
 
             if fix.get("revised_command"):
                 new_cmd = fix["revised_command"].strip()
@@ -1262,6 +1266,11 @@ Task plan   : {analysis.get('task_plan', [])}
 {list(env_hints.keys())}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PORT RULE: port {_SELF_PORT} is already taken by the host service in this environment.
+Never start a server on it and never curl it. Django's default is 8000, so ALWAYS
+pass an explicit free port, e.g. `python manage.py runserver 0.0.0.0:8765`, and
+fetch pages from that port (add `-H "Host: localhost"` if ALLOWED_HOSTS rejects it).
 
 RUNNABILITY DECISION RULES (follow strictly):
 - runnable=true if there is a concrete Python entry point (main.py, app.py,
@@ -2610,6 +2619,10 @@ _PORT_RE = re.compile(
     r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})"
 )
 _DEFAULT_SERVER_PORTS = (8000, 5000, 8501, 7860, 8050, 8888, 3000)
+# RepoSage's own API listens here. A repo server started on the same port can
+# never bind it, and probing it (or curl-ing it) answers with RepoSage's own
+# 404 — which used to be mistaken for the repo's homepage.
+_SELF_PORT = int(os.environ.get("PORT", "8000"))
 
 
 def _guess_ports(run_cmd: str, text: str) -> set[int]:
@@ -2624,7 +2637,8 @@ def _guess_ports(run_cmd: str, text: str) -> set[int]:
                     ports.add(int(g))
                 except ValueError:
                     pass
-    return ports or set(_DEFAULT_SERVER_PORTS)
+    ports.discard(_SELF_PORT)
+    return ports or {p for p in _DEFAULT_SERVER_PORTS if p != _SELF_PORT}
 
 
 async def _probe_port(port: int, timeout: float = 0.3) -> bool:
@@ -2694,6 +2708,7 @@ async def _run_direct(
     workspace: str,
     venv_path: str,
     is_gui:    bool = False,
+    extra_env: Optional[dict] = None,
 ) -> tuple[int, str, str]:
     """
     Runs the command, streaming stdout/stderr while it's alive.
@@ -2745,6 +2760,7 @@ async def _run_direct(
             stderr=asyncio.subprocess.PIPE,
             env={
                 **os.environ,
+                **(extra_env or {}),
                 "PYTHONPATH":  workspace,
                 "HOME":        os.environ.get("HOME", "/tmp"),
                 # Headless rendering for every toolkit we might meet. There is
@@ -2962,19 +2978,21 @@ async def _try_autofix(
 #  Apply Fix
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _apply_fix(fix: dict, workspace: str, venv_path: str):
+async def _apply_fix(fix: dict, workspace: str, venv_path: str,
+                     job_env: Optional[dict] = None):
     pip = _pip_path(venv_path) if venv_path else "pip"
 
     for pkg in fix.get("packages_to_install", [])[:10]:
         pkg = _sanitise(str(pkg))
         if pkg and venv_path:
-            await _run_cmd([pip, "install", pkg], workspace, timeout=120)
+            await _run_cmd([pip, "install", pkg], workspace, timeout=120, env=job_env)
 
     env_vars = fix.get("env_vars_to_set", {})
     if isinstance(env_vars, dict):
         for k, v in env_vars.items():
             if k:
-                os.environ[str(k)] = str(v)
+                if job_env is not None:
+                    job_env[str(k)] = str(v)
 
     for file_spec in fix.get("files_to_create", [])[:5]:
         try:
@@ -3369,10 +3387,12 @@ async def _run_cmd(
     cmd:     list,
     cwd:     str,
     timeout: int = 120,
+    env:     Optional[dict] = None,
 ) -> tuple[bool, str]:
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=cwd,
+            env={**os.environ, **env} if env else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

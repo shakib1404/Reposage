@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import tempfile
@@ -261,13 +262,23 @@ class _ClonedRepository(Repository):
             self._tempdir = TemporaryDirectory()
             self.root_path = Path(self._tempdir.__enter__())
             try:
-                subprocess.check_call(  # noqa: S603
+                subprocess.run(  # noqa: S603
                     [GIT_PATH, "clone", str(self._clone_uri), "."],  # type: ignore
                     cwd=self.root_path,
-                    stderr=subprocess.DEVNULL,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    # never block on a credentials prompt for a missing repo
+                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo"},
                 )
             except subprocess.CalledProcessError as e:
-                msg = f"Failed to clone `{self._clone_uri}`: {e!s}"
+                err = (e.stderr or "").lower()
+                if "could not read username" in err or "not found" in err or "authentication failed" in err:
+                    msg = (f"Repository not found or private: {self._clone_uri} — "
+                           "check the URL for typos (it must be a public repository).")
+                else:
+                    msg = f"Failed to clone `{self._clone_uri}`: {(e.stderr or '').strip()[:300]}"
                 raise RepositoryError(msg) from None
         return super().__enter__()
 

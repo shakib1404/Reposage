@@ -702,7 +702,10 @@ def _detection_to_dict(det: Detection, min_similarity: float) -> dict | None:
     test_src = det.test_source  # Source(det.test, det.comparison.slices1)
     slices = []
 
-    for s1, s2 in zip(det.comparison.slices1, det.comparison.slices2):
+    # Prefer the aligned pairs: slices1[i] and slices2[i] are NOT counterparts
+    # when the copied blocks appear in a different order in the two files.
+    pairs = det.comparison.pairs or tuple(zip(det.comparison.slices1, det.comparison.slices2))
+    for s1, s2 in pairs:
         # Convert byte offsets → 0-indexed line numbers (vendetect convention)
         try:
             ls1 = test_src.byte_offset_slice_to_lines_slice(s1)

@@ -27,7 +27,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
-from dupdetect import SKIP_DIRS, _extract_functions, _get_embedder
+from dupdetect import SKIP_DIRS, clone_error_message, _extract_functions, _get_embedder
 
 log = logging.getLogger(__name__)
 
@@ -121,6 +121,7 @@ async def _clone_and_extract(repo_ref: str):
         proc = await asyncio.create_subprocess_exec(
             "git", "clone", "--depth", "1", repo_ref, tmp_dir,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo"},
         )
         try:
             _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
@@ -129,7 +130,7 @@ async def _clone_and_extract(repo_ref: str):
             yield ("__RESULT__", None, None)
             return
         if proc.returncode != 0:
-            yield {"type": "error", "message": f"git clone failed: {err.decode(errors='ignore')[:300]}"}
+            yield {"type": "error", "message": clone_error_message(repo_ref, err)}
             yield ("__RESULT__", None, None)
             return
         workspace = tmp_dir
