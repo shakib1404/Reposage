@@ -136,7 +136,8 @@ async def analyze_repo(
                 proc.kill()
                 raise RuntimeError("git clone timed out")
             if proc.returncode != 0:
-                raise RuntimeError(f"git clone failed: {err.decode(errors='ignore')[:400]}")
+                from dupdetect import clone_error_message
+                raise RuntimeError(clone_error_message(full_name, err))
 
         # ── Core pipeline ─────────────────────────────────────────────────────
         parsed_files = _parse_all_files(work_path)
@@ -333,6 +334,10 @@ class _FileVisitor(ast.NodeVisitor):
         self.call_sites: list[dict] = []
         self._class_stack:  list[str] = []
         self._method_stack: list[str] = []
+        # >0 while inside a function body or an `if TYPE_CHECKING:` block.
+        # Imports there do not run when the module is imported, so they are not
+        # load-time dependencies — see `deferred` below.
+        self._deferred_depth = 0
 
     # ── Imports ───────────────────────────────────────────────────────────────
 
@@ -344,6 +349,7 @@ class _FileVisitor(ast.NodeVisitor):
                 "is_relative": False,
                 "level":       0,
                 "alias":       alias.asname,
+                "deferred":    self._deferred_depth > 0,
             })
         self.generic_visit(node)
 
@@ -357,6 +363,7 @@ class _FileVisitor(ast.NodeVisitor):
             "is_relative": node.level > 0,
             "level":       node.level,
             "aliases":     aliases,
+            "deferred":    self._deferred_depth > 0,
         })
         self.generic_visit(node)
 
@@ -423,7 +430,29 @@ class _FileVisitor(ast.NodeVisitor):
 
     # ── Module-level functions ─────────────────────────────────────────────────
 
+    def visit_If(self, node: ast.If):
+        # `if TYPE_CHECKING:` / `if typing.TYPE_CHECKING:` — never true at runtime.
+        test = node.test
+        guarded = (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or \
+                  (isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
+        if guarded:
+            self._deferred_depth += 1
+            for stmt in node.body:
+                self.visit(stmt)
+            self._deferred_depth -= 1
+            for stmt in node.orelse:
+                self.visit(stmt)
+        else:
+            self.generic_visit(node)
+
     def visit_FunctionDef(self, node: ast.FunctionDef):
+        self._deferred_depth += 1
+        try:
+            self._visit_function(node)
+        finally:
+            self._deferred_depth -= 1
+
+    def _visit_function(self, node: ast.FunctionDef):
         if self._class_stack:
             # Methods handled inside visit_ClassDef
             self.generic_visit(node)
@@ -785,7 +814,7 @@ def _find_top_level_modules(ws: Path, all_keys: set[str]) -> list[str]:
 #  Step 3b — MDG via AST parsing  (fallback, still robust)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_mdg_ast(parsed_files: list[dict]) -> list[dict]:
+def _build_mdg_ast(parsed_files: list[dict], include_deferred: bool = True) -> list[dict]:
     """
     AST-based MDG fallback. More accurate than the original because:
     • No false-positive short-name matching
@@ -799,7 +828,13 @@ def _build_mdg_ast(parsed_files: list[dict]) -> list[dict]:
         src = pf["mod_key"]
         is_init = os.path.basename(pf.get("path", "")) == "__init__.py"
         for imp in pf["imports"]:
-            targets = _resolve_import_ast(imp, src, all_keys, is_init)
+            # The architecture audit passes include_deferred=False: a lazy
+            # import inside a function (usually written precisely to break a
+            # cycle) or under TYPE_CHECKING is not a load-time dependency.
+            if not include_deferred and imp.get("deferred"):
+                continue
+            targets = _resolve_import_ast(imp, src, all_keys, is_init,
+                                          load_time=not include_deferred)
             for tgt in targets:
                 if tgt != src:
                     edge_weights[(src, tgt)] += 1
@@ -822,6 +857,7 @@ def _resolve_import_ast(
     src_mod: str,
     all_keys: set[str],
     is_pkg_init: bool = False,
+    load_time: bool = False,
 ) -> list[str]:
     """
     Resolve an ImportInfo to a list of repo-internal mod_keys.
@@ -854,13 +890,20 @@ def _resolve_import_ast(
             candidates = [".".join(base_parts)]
 
         for cand in candidates:
-            if cand in all_keys:
-                resolved.add(cand)
             # Try each imported name as a submodule
-            for name in names:
-                sub = f"{cand}.{name}"
-                if sub in all_keys:
-                    resolved.add(sub)
+            subs = {f"{cand}.{name}" for name in names if f"{cand}.{name}" in all_keys}
+            # Load-time view only (the architecture audit): `from . import
+            # sessions` takes a submodule out of a package that is already
+            # being imported; it does not depend on the package's own
+            # __init__. Counting that edge made every package look like it
+            # imports itself and created a cycle through __init__ for any
+            # package whose __init__ imports its own submodules. Kept when any
+            # imported name is NOT a submodule (e.g. a constant in __init__).
+            only_submodules = not module and subs and len(subs) == len(
+                [n for n in names if n != "*"])
+            if cand in all_keys and not (load_time and only_submodules):
+                resolved.add(cand)
+            resolved |= subs
 
     else:
         # Absolute: try exact full dotted path

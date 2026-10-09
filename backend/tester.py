@@ -572,8 +572,16 @@ def _parse_audit(out: str):
         raw = _json_from(out)
     except ValueError:
         return None
-    deps = raw if isinstance(raw, list) else raw.get("dependencies")
-    return deps if isinstance(deps, list) else None
+    deps = raw if isinstance(raw, list) else (
+        raw.get("dependencies") if isinstance(raw, dict) else None)
+    # pip-audit's stderr (a failed build, a resolver trace) can contain
+    # JSON-looking fragments — a list of strings, a dict of build hooks — that
+    # _json_from happily extracts. Only a list of {"name": ...} records is a
+    # real audit result; anything else must read as "unreadable" so the caller
+    # falls back to auditing the exact pins instead of crashing on it.
+    if isinstance(deps, list) and all(isinstance(d, dict) and "name" in d for d in deps):
+        return deps
+    return None
 
 
 def _audit_error(out: str) -> str:
@@ -915,7 +923,7 @@ def _architecture_findings(workspace: str) -> list[dict]:
 
     try:
         symbols   = analyzer._build_symbol_table(parsed)
-        mdg_edges = analyzer._build_mdg_ast(parsed)
+        mdg_edges = analyzer._build_mdg_ast(parsed, include_deferred=False)
         fcg_edges = analyzer._build_fcg(parsed, symbols)
         modules   = analyzer._build_modules(parsed, mdg_edges)
     except Exception as exc:
@@ -2017,6 +2025,9 @@ async def _clone(repo_full_name: str) -> str:
         "git", "clone", "--depth", "1", url, ws,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        # never wait on a credentials prompt: GitHub asks for one when the
+        # repository does not exist
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo"},
     )
     try:
         _, err = await asyncio.wait_for(proc.communicate(), timeout=CLONE_TIMEOUT)
@@ -2026,7 +2037,8 @@ async def _clone(repo_full_name: str) -> str:
         raise RuntimeError("git clone timed out")
     if proc.returncode != 0:
         shutil.rmtree(ws, ignore_errors=True)
-        raise RuntimeError(f"git clone failed: {err.decode()[:400]}")
+        from dupdetect import clone_error_message
+        raise RuntimeError(clone_error_message(repo_full_name, err))
     return ws
 
 

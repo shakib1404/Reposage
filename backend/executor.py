@@ -1950,6 +1950,12 @@ async def _clone_repo(repo_full_name: str, metrics: dict,
 
         last_err = stderr.decode(errors="ignore")[:600]
         shutil.rmtree(workspace, ignore_errors=True)
+        # A missing/misspelt/private repository will not appear on a retry;
+        # say so now instead of burning ~15s of back-off on it.
+        from dupdetect import clone_error_message
+        friendly = clone_error_message(repo_full_name, stderr)
+        if friendly.startswith("Repository not found"):
+            raise RuntimeError(friendly)
         log.warning("Clone attempt %d failed: %s", attempt, last_err[:120])
         if attempt < max_attempts:
             await asyncio.sleep(5 * attempt)   # 5s, 10s back-off
